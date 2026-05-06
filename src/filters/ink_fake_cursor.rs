@@ -48,7 +48,11 @@ impl Filter for InkFakeCursorFilter {
             }
 
             if is_fake_cursor(&self.pending) {
-                output.extend_from_slice(fake_cursor_inner(&self.pending));
+                let (inner, residual) = fake_cursor_payload(&self.pending);
+                output.extend_from_slice(inner);
+                if let Some(residual) = residual {
+                    output.extend_from_slice(&residual);
+                }
                 self.pending.clear();
                 continue;
             }
@@ -112,13 +116,26 @@ fn is_cursor_hide_prefix(data: &[u8]) -> bool {
 
 const FAKE_CURSOR_START: &[u8] = b"\x1b[7m";
 
-/// Length of the trailing SGR sequence that closes a fake cursor.
+/// Describes the trailing SGR sequence that closes a fake cursor.
 ///
+/// `len` is the byte length of that SGR (including the leading ESC `[`
+/// and trailing `m`). `residual` is `Some(rewritten)` when the SGR
+/// carried unrelated parameters that must be preserved in the output
+/// after stripping the inverse-off marker — for example `\x1b[38;5;244;27m`
+/// becomes `\x1b[38;5;244m`. It is `None` when the entire SGR was just a
+/// reset (`\x1b[m`, `\x1b[0m`, `\x1b[27m`, `\x1b[2;27m`, etc.) and can
+/// be discarded outright.
+struct FakeCursorEnd {
+    len: usize,
+    residual: Option<Vec<u8>>,
+}
+
 /// Ink uses several variants to leave the inverse-attribute state:
-/// `\x1b[m` (full reset), `\x1b[0m`, `\x1b[27m`, `\x1b[2;27m`, etc. We
-/// recognize any SGR sequence whose semicolon-separated numeric
-/// parameter list contains `0` or `27`.
-fn fake_cursor_end_len(data: &[u8]) -> Option<usize> {
+/// `\x1b[m` (full reset), `\x1b[0m`, `\x1b[27m`, `\x1b[2;27m`, or even
+/// SGRs that bundle inverse-off with the next cell's attributes such as
+/// `\x1b[38;5;244;27m`. We recognize any SGR whose parameter list
+/// contains `0` or `27` (or is empty, i.e. a bare reset).
+fn fake_cursor_end(data: &[u8]) -> Option<FakeCursorEnd> {
     if !data.ends_with(b"m") {
         return None;
     }
@@ -129,50 +146,91 @@ fn fake_cursor_end_len(data: &[u8]) -> Option<usize> {
         return None;
     }
     let params = &bytes[start + 2..];
-    let mut found = params.is_empty(); // bare \x1b[m == full reset
+    if params.is_empty() {
+        return Some(FakeCursorEnd {
+            len: data.len() - start,
+            residual: None,
+        });
+    }
+    let mut found = false;
+    let mut kept: Vec<&[u8]> = Vec::new();
+    let mut full_reset = false;
     for part in params.split(|&b| b == b';') {
         if !part.iter().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        if matches!(part, b"0" | b"27") || (part.is_empty() && !found) {
-            found = true;
+        match part {
+            b"0" => {
+                found = true;
+                full_reset = true;
+            }
+            b"27" => {
+                found = true;
+            }
+            b"" => {
+                // Empty parameter inside a list (e.g. `;;`) is treated as 0
+                // by terminals; keep parity with the discard path.
+                found = true;
+                full_reset = true;
+            }
+            _ => kept.push(part),
         }
     }
-    if found {
-        Some(data.len() - start)
-    } else {
-        None
+    if !found {
+        return None;
     }
+    let residual = if full_reset || kept.is_empty() {
+        None
+    } else {
+        let mut out = Vec::with_capacity(3 + kept.iter().map(|p| p.len() + 1).sum::<usize>());
+        out.extend_from_slice(b"\x1b[");
+        for (i, part) in kept.iter().enumerate() {
+            if i > 0 {
+                out.push(b';');
+            }
+            out.extend_from_slice(part);
+        }
+        out.push(b'm');
+        Some(out)
+    };
+    Some(FakeCursorEnd {
+        len: data.len() - start,
+        residual,
+    })
 }
 
 fn is_fake_cursor(data: &[u8]) -> bool {
     if !data.starts_with(FAKE_CURSOR_START) {
         return false;
     }
-    let Some(end_len) = fake_cursor_end_len(data) else {
+    let Some(end) = fake_cursor_end(data) else {
         return false;
     };
-    is_fake_cursor_inner(&data[FAKE_CURSOR_START.len()..data.len() - end_len])
+    is_fake_cursor_inner(&data[FAKE_CURSOR_START.len()..data.len() - end.len])
 }
 
 fn is_fake_cursor_prefix(data: &[u8]) -> bool {
     (FAKE_CURSOR_START.starts_with(data) && data.len() < FAKE_CURSOR_START.len())
         || (data.starts_with(FAKE_CURSOR_START)
             && data.len() <= MAX_PENDING_FAKE_CURSOR_LEN
-            && !data[FAKE_CURSOR_START.len()..].contains(&b'\n')
-            && fake_cursor_end_len(data).is_none())
+            && fake_cursor_end(data).is_none())
 }
 
 fn is_fake_cursor_inner(data: &[u8]) -> bool {
     !data.is_empty()
-        && !data.contains(&b'\n')
         && printable_text_without_cursor_moves(data)
             .is_some_and(|text| text.graphemes(true).count() == 1)
 }
 
-fn fake_cursor_inner(data: &[u8]) -> &[u8] {
-    let end_len = fake_cursor_end_len(data).unwrap_or(0);
-    &data[FAKE_CURSOR_START.len()..data.len() - end_len]
+fn fake_cursor_payload(data: &[u8]) -> (&[u8], Option<Vec<u8>>) {
+    let (end_len, residual) = match fake_cursor_end(data) {
+        Some(end) => (end.len, end.residual),
+        None => (0, None),
+    };
+    (
+        &data[FAKE_CURSOR_START.len()..data.len() - end_len],
+        residual,
+    )
 }
 
 fn printable_text_without_cursor_moves(data: &[u8]) -> Option<String> {
@@ -181,7 +239,7 @@ fn printable_text_without_cursor_moves(data: &[u8]) -> Option<String> {
 
     while index < data.len() {
         match data[index] {
-            b'\r' => {
+            b'\r' | b'\n' => {
                 index += 1;
             }
             0x1b => {
@@ -275,8 +333,21 @@ mod tests {
     fn test_cursor_filter_strips_fake_cursor_with_compound_sgr_reset_terminator() {
         let mut filter = InkFakeCursorFilter::new();
         // Ink uses \x1b[2;27m (faint + invert-off) in the very first frame.
+        // The 27 is consumed; the 2 is preserved so the next cell's faint
+        // attribute survives.
         let input = b"a\x1b[7mT\x1b[2;27mry";
-        let expected = b"aTry";
+        let expected = b"aT\x1b[2mry";
+        assert_eq!(filter.filter(input).as_ref(), expected);
+    }
+
+    #[test]
+    fn test_cursor_filter_strips_fake_cursor_with_color_bundled_terminator() {
+        let mut filter = InkFakeCursorFilter::new();
+        // Observed in the wild: Ink draws a single inverse cell, advances the
+        // cursor with a newline, and then opens the next paint with an SGR
+        // that bundles the inverse-off marker with a foreground color.
+        let input = b"a\x1b[7m \r\n\x1b[38;5;244;27m\xe2\x94\x80b";
+        let expected = b"a \r\n\x1b[38;5;244m\xe2\x94\x80b";
         assert_eq!(filter.filter(input).as_ref(), expected);
     }
 
@@ -359,6 +430,16 @@ mod tests {
         assert_eq!(
             filter.filter(b"a\x1b[7mf\x1b[6C\x1b[27m b").as_ref(),
             b"af\x1b[6C b"
+        );
+    }
+
+    #[test]
+    fn test_cursor_filter_removes_fake_cursor_attributes_across_newline() {
+        let mut filter = InkFakeCursorFilter::new();
+
+        assert_eq!(
+            filter.filter(b"a\x1b[7m \r\n\x1b[27mb").as_ref(),
+            b"a \r\nb"
         );
     }
 
