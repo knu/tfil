@@ -20,6 +20,10 @@ const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
     about = "Run a command through a configurable terminal output filter"
 )]
 struct Cli {
+    /// Drop DECSCUSR (cursor shape) sequences
+    #[arg(long)]
+    strip_cursor_shape: bool,
+
     /// Strip Ink's fake cursor sequences so the terminal's native cursor shows through
     #[arg(long)]
     strip_ink_fake_cursor: bool,
@@ -27,10 +31,6 @@ struct Cli {
     /// Drop OSC 0/1/2 sequences (icon name and window title)
     #[arg(long)]
     strip_osc_titles: bool,
-
-    /// Drop DECSCUSR (cursor shape) sequences
-    #[arg(long)]
-    strip_cursor_shape: bool,
 
     /// Write the pre-filter PTY output stream to FILE for debugging
     #[arg(long, value_name = "FILE")]
