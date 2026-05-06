@@ -11,6 +11,11 @@ readme = "README.md"
 keywords = ["pty", "terminal", "filter", "ink", "tui"]
 categories = ["command-line-utilities"]
 
+[package.metadata.release]
+publish = false
+pre-release-commit-message = "Bump version to {{version}}"
+tag-message = "Release version {{version}}"
+
 [lib]
 name = "tfil"
 path = "src/lib.rs"
