@@ -111,23 +111,48 @@ fn is_cursor_hide_prefix(data: &[u8]) -> bool {
 }
 
 const FAKE_CURSOR_START: &[u8] = b"\x1b[7m";
-const FAKE_CURSOR_ENDS: &[&[u8]] = &[b"\x1b[27m", b"\x1b[m"];
 
-fn fake_cursor_end(data: &[u8]) -> Option<&'static [u8]> {
-    FAKE_CURSOR_ENDS
-        .iter()
-        .copied()
-        .find(|end| data.ends_with(end))
+/// Length of the trailing SGR sequence that closes a fake cursor.
+///
+/// Ink uses several variants to leave the inverse-attribute state:
+/// `\x1b[m` (full reset), `\x1b[0m`, `\x1b[27m`, `\x1b[2;27m`, etc. We
+/// recognize any SGR sequence whose semicolon-separated numeric
+/// parameter list contains `0` or `27`.
+fn fake_cursor_end_len(data: &[u8]) -> Option<usize> {
+    if !data.ends_with(b"m") {
+        return None;
+    }
+    // Walk back to find the matching ESC '['.
+    let bytes = &data[..data.len() - 1];
+    let start = bytes.iter().rposition(|&b| b == 0x1B)?;
+    if !bytes[start..].starts_with(b"\x1b[") {
+        return None;
+    }
+    let params = &bytes[start + 2..];
+    let mut found = params.is_empty(); // bare \x1b[m == full reset
+    for part in params.split(|&b| b == b';') {
+        if !part.iter().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if matches!(part, b"0" | b"27") || (part.is_empty() && !found) {
+            found = true;
+        }
+    }
+    if found {
+        Some(data.len() - start)
+    } else {
+        None
+    }
 }
 
 fn is_fake_cursor(data: &[u8]) -> bool {
     if !data.starts_with(FAKE_CURSOR_START) {
         return false;
     }
-    let Some(end) = fake_cursor_end(data) else {
+    let Some(end_len) = fake_cursor_end_len(data) else {
         return false;
     };
-    is_fake_cursor_inner(&data[FAKE_CURSOR_START.len()..data.len() - end.len()])
+    is_fake_cursor_inner(&data[FAKE_CURSOR_START.len()..data.len() - end_len])
 }
 
 fn is_fake_cursor_prefix(data: &[u8]) -> bool {
@@ -135,7 +160,7 @@ fn is_fake_cursor_prefix(data: &[u8]) -> bool {
         || (data.starts_with(FAKE_CURSOR_START)
             && data.len() <= MAX_PENDING_FAKE_CURSOR_LEN
             && !data[FAKE_CURSOR_START.len()..].contains(&b'\n')
-            && fake_cursor_end(data).is_none())
+            && fake_cursor_end_len(data).is_none())
 }
 
 fn is_fake_cursor_inner(data: &[u8]) -> bool {
@@ -146,7 +171,7 @@ fn is_fake_cursor_inner(data: &[u8]) -> bool {
 }
 
 fn fake_cursor_inner(data: &[u8]) -> &[u8] {
-    let end_len = fake_cursor_end(data).map(|e| e.len()).unwrap_or(0);
+    let end_len = fake_cursor_end_len(data).unwrap_or(0);
     &data[FAKE_CURSOR_START.len()..data.len() - end_len]
 }
 
@@ -244,6 +269,31 @@ mod tests {
             filter.filter(b"a\x1b[7mEnter\x1b[27mb").as_ref(),
             b"a\x1b[7mEnter\x1b[27mb"
         );
+    }
+
+    #[test]
+    fn test_cursor_filter_strips_fake_cursor_with_compound_sgr_reset_terminator() {
+        let mut filter = InkFakeCursorFilter::new();
+        // Ink uses \x1b[2;27m (faint + invert-off) in the very first frame.
+        let input = b"a\x1b[7mT\x1b[2;27mry";
+        let expected = b"aTry";
+        assert_eq!(filter.filter(input).as_ref(), expected);
+    }
+
+    #[test]
+    fn test_cursor_filter_strips_fake_cursor_with_zero_sgr_reset_terminator() {
+        let mut filter = InkFakeCursorFilter::new();
+        let input = b"a\x1b[7mT\x1b[0mb";
+        let expected = b"aTb";
+        assert_eq!(filter.filter(input).as_ref(), expected);
+    }
+
+    #[test]
+    fn test_cursor_filter_preserves_unrelated_trailing_sgr() {
+        // \x1b[31m doesn't include 0 or 27; not a fake cursor terminator.
+        let mut filter = InkFakeCursorFilter::new();
+        let input = b"a\x1b[7mEnter\x1b[27m\x1b[31mb";
+        assert_eq!(filter.filter(input).as_ref(), input);
     }
 
     #[test]
