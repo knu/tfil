@@ -3,7 +3,9 @@ use clap::Parser;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
+use std::ffi::OsString;
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,9 +34,10 @@ struct Cli {
     #[arg(long)]
     strip_osc_titles: bool,
 
-    /// Write the pre-filter PTY output stream to FILE for debugging
+    /// Write the pre-filter PTY output stream to FILE for debugging.
+    /// Defaults to TFIL_DEBUG_DUMP when set.
     #[arg(long, value_name = "FILE")]
-    debug_dump: Option<std::path::PathBuf>,
+    debug_dump: Option<PathBuf>,
 
     /// Command to run, for example "claude", "gemini", or "ccmanager"
     command: String,
@@ -94,9 +97,10 @@ fn run(cli: Cli) -> Result<i32> {
     let done = Arc::new(AtomicBool::new(false));
 
     // child -> filter -> stdout
+    let debug_dump = debug_dump_path(cli.debug_dump.as_deref());
     let stdout_thread = {
         let done = done.clone();
-        let mut dump = cli.debug_dump.as_deref().and_then(open_dump_file);
+        let mut dump = debug_dump.as_deref().and_then(open_dump_file);
         thread::spawn(move || -> Result<()> {
             let mut filters = filters;
             let mut buf = [0u8; 65536];
@@ -233,7 +237,17 @@ fn current_pty_size() -> PtySize {
     }
 }
 
-fn open_dump_file(path: &std::path::Path) -> Option<std::fs::File> {
+fn debug_dump_path(cli_path: Option<&Path>) -> Option<PathBuf> {
+    choose_debug_dump_path(cli_path, std::env::var_os("TFIL_DEBUG_DUMP"))
+}
+
+fn choose_debug_dump_path(cli_path: Option<&Path>, env_path: Option<OsString>) -> Option<PathBuf> {
+    cli_path
+        .map(PathBuf::from)
+        .or_else(|| env_path.map(PathBuf::from))
+}
+
+fn open_dump_file(path: &Path) -> Option<std::fs::File> {
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -280,5 +294,28 @@ impl Drop for RawModeGuard {
                 libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn debug_dump_path_uses_env_when_cli_is_absent() {
+        let path = choose_debug_dump_path(None, Some(OsString::from("env.dump")));
+
+        assert_eq!(path.as_deref(), Some(Path::new("env.dump")));
+    }
+
+    #[test]
+    fn debug_dump_path_prefers_cli_over_env() {
+        let path = choose_debug_dump_path(
+            Some(Path::new("cli.dump")),
+            Some(OsString::from("env.dump")),
+        );
+
+        assert_eq!(path.as_deref(), Some(Path::new("cli.dump")));
     }
 }
