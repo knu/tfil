@@ -48,10 +48,13 @@ impl Filter for InkFakeCursorFilter {
             }
 
             if is_fake_cursor(&self.pending) {
-                let (inner, residual) = fake_cursor_payload(&self.pending);
-                output.extend_from_slice(inner);
-                if let Some(residual) = residual {
-                    output.extend_from_slice(&residual);
+                let payload = fake_cursor_payload(&self.pending);
+                if let Some(leading) = payload.leading_residual {
+                    output.extend_from_slice(&leading);
+                }
+                output.extend_from_slice(payload.inner);
+                if let Some(trailing) = payload.trailing_residual {
+                    output.extend_from_slice(&trailing);
                 }
                 self.pending.clear();
                 continue;
@@ -114,7 +117,21 @@ fn is_cursor_hide_prefix(data: &[u8]) -> bool {
     b"\x1b[?25l".starts_with(data)
 }
 
-const FAKE_CURSOR_START: &[u8] = b"\x1b[7m";
+/// Shortest possible inverse-enabling SGR. Used only for prefix tracking
+/// while bytes are still arriving; classification uses [`fake_cursor_start`].
+const MIN_FAKE_CURSOR_START: &[u8] = b"\x1b[7m";
+
+/// Describes the leading SGR that enables inverse for a fake cursor.
+///
+/// Ink usually emits `\x1b[7m` on its own, but it sometimes folds the
+/// inverse-on into a compound SGR that also resets the previous cell's
+/// attributes, e.g. `\x1b[39;7m` (default foreground + inverse-on). We
+/// strip the `7` and keep any remaining parameters as `residual` so the
+/// surrounding attribute state still resolves correctly.
+struct FakeCursorStart {
+    len: usize,
+    residual: Option<Vec<u8>>,
+}
 
 /// Describes the trailing SGR sequence that closes a fake cursor.
 ///
@@ -128,6 +145,77 @@ const FAKE_CURSOR_START: &[u8] = b"\x1b[7m";
 struct FakeCursorEnd {
     len: usize,
     residual: Option<Vec<u8>>,
+}
+
+/// Recognizes the leading inverse-on SGR. Returns `Some` when `data`
+/// begins with an SGR whose parameter list contains `7` (and no `0`
+/// reset — a reset would cancel the inverse before any text). The
+/// returned `residual` re-emits the non-`7` parameters as their own SGR
+/// so the surrounding attribute state survives.
+fn fake_cursor_start(data: &[u8]) -> Option<FakeCursorStart> {
+    if !data.starts_with(b"\x1b[") {
+        return None;
+    }
+    let after_intro = &data[2..];
+    let final_index = after_intro.iter().position(|b| (0x40..=0x7E).contains(b))?;
+    if after_intro[final_index] != b'm' {
+        return None;
+    }
+    let params = &after_intro[..final_index];
+    let mut found = false;
+    let mut kept: Vec<&[u8]> = Vec::new();
+    for part in params.split(|&b| b == b';') {
+        if !part.iter().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        match part {
+            b"7" => {
+                found = true;
+            }
+            // A `0` (or empty, which terminals treat as 0) inside the
+            // start SGR would reset attributes after enabling inverse,
+            // so it cannot mark the opening of a fake cursor.
+            b"0" | b"" => return None,
+            _ => kept.push(part),
+        }
+    }
+    if !found {
+        return None;
+    }
+    let residual = if kept.is_empty() {
+        None
+    } else {
+        let mut out = Vec::with_capacity(3 + kept.iter().map(|p| p.len() + 1).sum::<usize>());
+        out.extend_from_slice(b"\x1b[");
+        for (i, part) in kept.iter().enumerate() {
+            if i > 0 {
+                out.push(b';');
+            }
+            out.extend_from_slice(part);
+        }
+        out.push(b'm');
+        Some(out)
+    };
+    Some(FakeCursorStart {
+        len: 2 + final_index + 1,
+        residual,
+    })
+}
+
+/// True when `data` could still grow into a fake-cursor opening SGR.
+fn is_fake_cursor_start_prefix(data: &[u8]) -> bool {
+    if !data.starts_with(b"\x1b") {
+        return false;
+    }
+    if data == b"\x1b" {
+        return true;
+    }
+    if !data.starts_with(b"\x1b[") {
+        return false;
+    }
+    let params = &data[2..];
+    // No final byte yet: still parameters/intermediates; must remain valid digits or ';'.
+    params.iter().all(|b| b.is_ascii_digit() || *b == b';')
 }
 
 /// Ink uses several variants to leave the inverse-attribute state:
@@ -200,20 +288,34 @@ fn fake_cursor_end(data: &[u8]) -> Option<FakeCursorEnd> {
 }
 
 fn is_fake_cursor(data: &[u8]) -> bool {
-    if !data.starts_with(FAKE_CURSOR_START) {
+    let Some(start) = fake_cursor_start(data) else {
         return false;
-    }
+    };
     let Some(end) = fake_cursor_end(data) else {
         return false;
     };
-    is_fake_cursor_inner(&data[FAKE_CURSOR_START.len()..data.len() - end.len])
+    if start.len + end.len > data.len() {
+        return false;
+    }
+    is_fake_cursor_inner(&data[start.len..data.len() - end.len])
 }
 
 fn is_fake_cursor_prefix(data: &[u8]) -> bool {
-    (FAKE_CURSOR_START.starts_with(data) && data.len() < FAKE_CURSOR_START.len())
-        || (data.starts_with(FAKE_CURSOR_START)
-            && data.len() <= MAX_PENDING_FAKE_CURSOR_LEN
-            && fake_cursor_end(data).is_none())
+    if data.is_empty() {
+        return false;
+    }
+    if is_fake_cursor_start_prefix(data) && fake_cursor_start(data).is_none() {
+        return true;
+    }
+    if fake_cursor_start(data).is_some()
+        && data.len() <= MAX_PENDING_FAKE_CURSOR_LEN
+        && fake_cursor_end(data).is_none()
+    {
+        return true;
+    }
+    // Also accept the legacy minimum prefix (`\x1b`, `\x1b[`, `\x1b[7`)
+    // so we keep buffering until enough bytes arrive to classify.
+    MIN_FAKE_CURSOR_START.starts_with(data) && data.len() < MIN_FAKE_CURSOR_START.len()
 }
 
 fn is_fake_cursor_inner(data: &[u8]) -> bool {
@@ -222,15 +324,26 @@ fn is_fake_cursor_inner(data: &[u8]) -> bool {
             .is_some_and(|text| text.graphemes(true).count() == 1)
 }
 
-fn fake_cursor_payload(data: &[u8]) -> (&[u8], Option<Vec<u8>>) {
-    let (end_len, residual) = match fake_cursor_end(data) {
+struct FakeCursorPayload<'a> {
+    leading_residual: Option<Vec<u8>>,
+    inner: &'a [u8],
+    trailing_residual: Option<Vec<u8>>,
+}
+
+fn fake_cursor_payload(data: &[u8]) -> FakeCursorPayload<'_> {
+    let (start_len, leading_residual) = match fake_cursor_start(data) {
+        Some(start) => (start.len, start.residual),
+        None => (0, None),
+    };
+    let (end_len, trailing_residual) = match fake_cursor_end(data) {
         Some(end) => (end.len, end.residual),
         None => (0, None),
     };
-    (
-        &data[FAKE_CURSOR_START.len()..data.len() - end_len],
-        residual,
-    )
+    FakeCursorPayload {
+        leading_residual,
+        inner: &data[start_len..data.len() - end_len],
+        trailing_residual,
+    }
 }
 
 fn printable_text_without_cursor_moves(data: &[u8]) -> Option<String> {
@@ -482,5 +595,52 @@ mod tests {
         assert_eq!(filter.filter(b"a\x1b[7m").as_ref(), b"a");
         assert_eq!(filter.finish(), b"\x1b[7m");
         assert_eq!(filter.filter(b"b").as_ref(), b"b");
+    }
+
+    #[test]
+    fn test_cursor_filter_strips_fake_cursor_with_color_bundled_starter() {
+        // Observed in claude (Ink) selection arrows: the inverse-on is
+        // folded into an SGR that also resets the previous cell's
+        // foreground (`\x1b[39;7m`). The `39` must survive so the trailing
+        // text reverts to default foreground correctly.
+        let mut filter = InkFakeCursorFilter::new();
+        let input = b"a\x1b[38;5;246m>\x1b[39;7m \x1b[mb";
+        let expected = b"a\x1b[38;5;246m>\x1b[39m b";
+        assert_eq!(filter.filter(input).as_ref(), expected);
+    }
+
+    #[test]
+    fn test_cursor_filter_strips_fake_cursor_with_color_bundled_starter_and_cursor_move() {
+        let mut filter = InkFakeCursorFilter::new();
+        let input = b"a\x1b[39;7m \x1b[78C\x1b[mb";
+        let expected = b"a\x1b[39m \x1b[78Cb";
+        assert_eq!(filter.filter(input).as_ref(), expected);
+    }
+
+    #[test]
+    fn test_cursor_filter_strips_fake_cursor_with_color_bundled_starter_and_terminator() {
+        // Both ends bundled: `\x1b[39;7m` opens, `\x1b[38;5;244;27m` closes.
+        let mut filter = InkFakeCursorFilter::new();
+        let input = b"a\x1b[39;7m \r\n\x1b[38;5;244;27m\xe2\x94\x80b";
+        let expected = b"a\x1b[39m \r\n\x1b[38;5;244m\xe2\x94\x80b";
+        assert_eq!(filter.filter(input).as_ref(), expected);
+    }
+
+    #[test]
+    fn test_cursor_filter_preserves_sgr_without_inverse() {
+        // An SGR that doesn't enable inverse must pass through unchanged.
+        let mut filter = InkFakeCursorFilter::new();
+        let input = b"a\x1b[39m b";
+        assert_eq!(filter.filter(input).as_ref(), input);
+    }
+
+    #[test]
+    fn test_cursor_filter_preserves_sgr_with_reset_then_inverse() {
+        // `\x1b[0;7m` resets attributes first, then enables inverse — this
+        // is a plain inverse opening, not a candidate for cursor stripping
+        // because the leading `0` would cancel everything before it.
+        let mut filter = InkFakeCursorFilter::new();
+        let input = b"a\x1b[0;7mEnter\x1b[27mb";
+        assert_eq!(filter.filter(input).as_ref(), input);
     }
 }
