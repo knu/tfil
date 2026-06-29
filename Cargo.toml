@@ -30,7 +30,7 @@ clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 memchr = "2"
 portable-pty = "0.9"
-signal-hook = "0.3"
+signal-hook = "0.4"
 unicode-segmentation = "1"
 
 # The profile that 'dist' will build with
