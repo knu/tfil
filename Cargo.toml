@@ -15,6 +15,7 @@ categories = ["command-line-utilities"]
 publish = false
 pre-release-commit-message = "Bump version to {{version}}"
 tag-message = "Release version {{version}}"
+pre-release-hook = ["sh", "-c", "git-cliff --tag \"v$NEW_VERSION\" --output CHANGELOG.md"]
 
 [lib]
 name = "tfil"

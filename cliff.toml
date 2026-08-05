@@ -1,0 +1,89 @@
+# git-cliff configuration for tfil.
+# Keep a Changelog-style sections, populated from commit subjects.
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to this project are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+While on `0.x.y`, the minor version bumps for new features and the patch
+version bumps for fixes.  Once `1.0.0` ships, the project will revisit and
+likely adopt strict [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+"""
+body = """
+
+{% if version -%}
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{%- else -%}
+## [Unreleased]
+{%- endif %}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {{ commit.message | split(pat="\n") | first | trim }}
+{%- endfor %}
+{% endfor %}
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = false
+filter_unconventional = false
+split_commits = false
+protect_breaking_commits = false
+filter_commits = true
+tag_pattern = "v[0-9]*"
+sort_commits = "oldest"
+
+# Order matters: the first matching parser wins.
+commit_parsers = [
+  # Skip commits that are not user-visible.
+  { message = "^Initial commit\\b", skip = true },
+  { message = "^(Merge|Merged)\\b", skip = true },
+  { message = "^Revert\\b", skip = true },
+  { message = "^Release v?[0-9]", skip = true },
+  # Explicit skip markers in the subject, e.g. "[chore]", "[doc]", "[ci skip]".
+  { message = "(?i)^[^\\n]*\\[(chore|docs?|ci skip|skip ci|skip changelog|no changelog)\\]", skip = true },
+  # Anchor keyword patterns to the subject line so the body of a
+  # user-visible commit can mention README, CI, etc. without making
+  # git-cliff drop the whole commit.
+  { message = "(?i)^[^\\n]*\\b(CI|GitHub Actions?|workflows?|Dependabot|Renovate|Mergify|merge protections?|merge batch|dependency PRs?|Harden-?Runner|pre-?commit|lint(er|ing)?|formatter|formatting|prettier|clippy|rustfmt|zizmor|actionlint|cargo-release|cargo-dist|git-cliff)\\b", skip = true },
+  { message = "(?i)^[^\\n]*\\b(README|docs?|documentation|comment|changelog|license|privacy policy)\\b", skip = true },
+  { message = "^(Refactor|Rework|Reformat|Clean ?up|Reorganize|Rename|Move|Format|Tidy|Tweak|Polish|Simplify|Inline|Extract|Restructure|Factor|Sort)\\b", skip = true },
+  { message = "^(Test|Tests)\\b", skip = true },
+
+  # Dependency-bot commits are skipped by author, with subject fallbacks for
+  # manual cherry-picks or squash commits.
+  { field = "author.name", pattern = "(?i)(dependabot|renovate|mergify)(\\[bot\\])?$", skip = true },
+  { field = "author.email", pattern = "(?i)@(dependabot|renovate|mergify)\\b", skip = true },
+  { field = "author.email", pattern = "^[0-9]+\\+(dependabot|renovate|mergify)(\\[bot\\])?@", skip = true },
+  { message = "^Bump\\b", skip = true },
+  { message = "^Update dependency\\b", skip = true },
+  { message = "^Update .* action to\\b", skip = true },
+  { message = "^Update Rust crate\\b", skip = true },
+  { message = "^Lock file maintenance\\b", skip = true },
+
+  # Conventional Commits: internal-only types.
+  { message = "^(chore|ci|build|docs?|test|tests|style|refactor|perf|revert)(\\(.+?\\))?!?:", skip = true },
+
+  # Conventional Commits: user-visible types.
+  { message = "^feat(\\(.+?\\))?!?:", group = "Added" },
+  { message = "^fix(\\(.+?\\))?!?:", group = "Fixed" },
+  { message = "^remove(\\(.+?\\))?!?:", group = "Removed" },
+  { message = "^deprecate(\\(.+?\\))?!?:", group = "Deprecated" },
+  { message = "^(security|sec)(\\(.+?\\))?!?:", group = "Security" },
+
+  # Traditional subjects.
+  { message = "^(Add|Introduce|Implement|Support|Allow|Enable|Expose|Show|Define|Install|Include)\\b", group = "Added" },
+  { message = "^(Fix|Correct|Repair|Resolve|Prevent|Avoid|Stop|Guard|Handle|Rescue|Protect|Properly|Stabilize|Recognize)\\b", group = "Fixed" },
+  { message = "^(Remove|Drop|Delete|Retire|Disable|Exclude|Omit|Skip|Ignore|Turn off)\\b", group = "Removed" },
+  { message = "^Deprecate\\b", group = "Deprecated" },
+  { message = "^(Secure|Harden|Sanitize)\\b", group = "Security" },
+
+  # Keep this catch-all last.
+  { message = ".*", group = "Changed" },
+]
