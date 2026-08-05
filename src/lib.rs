@@ -15,4 +15,5 @@
 //! assert_eq!(out.as_ref(), b"helloworld");
 //! ```
 
+pub mod codex_mouse_ui;
 pub mod filters;

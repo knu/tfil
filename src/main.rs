@@ -10,8 +10,10 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use tfil::codex_mouse_ui::{CodexMouseUi, MOUSE_DISABLE, MOUSE_ENABLE, POINTER_OFF};
 use tfil::filters::{
     CursorShapeFilter, Filter, InkFakeCursorFilter, OscTitleFilter, TmuxOscPassthroughFilter,
+    tmux_wrap,
 };
 
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")");
@@ -35,6 +37,12 @@ struct Cli {
     /// Drop OSC 0/1/2 sequences (icon name and window title)
     #[arg(long)]
     strip_osc_titles: bool,
+
+    /// Make Codex CLI's ›-marked numbered menus mouse-driven: hovering
+    /// moves the selection to follow the mouse, clicking confirms it,
+    /// and a pointer cursor is shown over options (OSC 22)
+    #[arg(long)]
+    codex_mouse_ui: bool,
 
     /// Wrap the given OSC sequences (comma-separated codes, e.g. "22"
     /// or "22,52") in a tmux DCS passthrough so they reach the outer
@@ -103,6 +111,14 @@ fn run(cli: Cli) -> Result<i32> {
             cli.tmux_osc_passthrough.clone(),
         )));
     }
+    let tmux_pointer = cli.tmux_osc_passthrough.contains(&22);
+
+    let mouse = cli.codex_mouse_ui.then(|| {
+        let size = current_pty_size();
+        let mut m = CodexMouseUi::new(size.rows, size.cols);
+        m.set_tmux_pointer(tmux_pointer);
+        Arc::new(Mutex::new(m))
+    });
 
     // Always put our stdin in raw mode: line editing is the slave PTY's
     // job (its termios is cooked by default), so the parent must forward
@@ -110,11 +126,18 @@ fn run(cli: Cli) -> Result<i32> {
     let _raw_guard = RawModeGuard::enter()?;
     let done = Arc::new(AtomicBool::new(false));
 
+    if mouse.is_some() {
+        let mut lock = io::stdout().lock();
+        let _ = lock.write_all(MOUSE_ENABLE);
+        let _ = lock.flush();
+    }
+
     // child -> filter -> stdout
     let debug_dump = debug_dump_path(cli.debug_dump.as_deref());
     let stdout_thread = {
         let done = done.clone();
         let mut dump = debug_dump.as_deref().and_then(open_dump_file);
+        let mouse = mouse.clone();
         thread::spawn(move || -> Result<()> {
             let mut filters = filters;
             let mut buf = [0u8; 65536];
@@ -129,8 +152,15 @@ fn run(cli: Cli) -> Result<i32> {
                             let _ = f.flush();
                         }
                         let out = run_filters(&mut filters, &buf[..n], &mut owned);
+                        let extra = mouse
+                            .as_ref()
+                            .map(|m| m.lock().unwrap().on_output(out))
+                            .filter(|e| !e.is_empty());
                         let mut lock = stdout.lock();
                         lock.write_all(out)?;
+                        if let Some(extra) = extra {
+                            lock.write_all(&extra)?;
+                        }
                         lock.flush()?;
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -150,6 +180,7 @@ fn run(cli: Cli) -> Result<i32> {
 
     // stdin -> child
     let stdin_done = done.clone();
+    let stdin_mouse = mouse.clone();
     thread::spawn(move || {
         let mut buf = [0u8; 65536];
         let stdin = io::stdin();
@@ -158,13 +189,34 @@ fn run(cli: Cli) -> Result<i32> {
             match lock.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if writer.write_all(&buf[..n]).is_err() {
-                        break;
+                    let to_child;
+                    let data: &[u8] = if let Some(m) = &stdin_mouse {
+                        let (child_bytes, term_bytes) = m.lock().unwrap().on_input(&buf[..n]);
+                        if !term_bytes.is_empty() {
+                            let mut out = io::stdout().lock();
+                            let _ = out.write_all(&term_bytes);
+                            let _ = out.flush();
+                        }
+                        to_child = child_bytes;
+                        &to_child
+                    } else {
+                        &buf[..n]
+                    };
+                    if !data.is_empty() {
+                        if writer.write_all(data).is_err() {
+                            break;
+                        }
+                        let _ = writer.flush();
                     }
-                    let _ = writer.flush();
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
+            }
+        }
+        if let Some(m) = &stdin_mouse {
+            let tail = m.lock().unwrap().finish_input();
+            if !tail.is_empty() && writer.write_all(&tail).is_ok() {
+                let _ = writer.flush();
             }
         }
     });
@@ -172,6 +224,7 @@ fn run(cli: Cli) -> Result<i32> {
     // SIGWINCH -> resize pty
     let winch_master = master.clone();
     let winch_done = done.clone();
+    let winch_mouse = mouse.clone();
     thread::spawn(move || {
         let Ok(mut signals) = Signals::new([SIGWINCH]) else {
             return;
@@ -184,6 +237,9 @@ fn run(cli: Cli) -> Result<i32> {
             if let Ok(m) = winch_master.lock() {
                 let _ = m.resize(size);
             }
+            if let Some(m) = &winch_mouse {
+                m.lock().unwrap().resize(size.rows, size.cols);
+            }
         }
     });
 
@@ -191,6 +247,16 @@ fn run(cli: Cli) -> Result<i32> {
     done.store(true, Ordering::SeqCst);
     let _ = stdout_thread.join();
 
+    if cli.codex_mouse_ui {
+        let mut lock = io::stdout().lock();
+        let _ = lock.write_all(MOUSE_DISABLE);
+        if tmux_pointer {
+            let _ = lock.write_all(&tmux_wrap(POINTER_OFF));
+        } else {
+            let _ = lock.write_all(POINTER_OFF);
+        }
+        let _ = lock.flush();
+    }
     if cli.strip_ink_fake_cursor {
         let _ = io::stdout().write_all(CURSOR_SHOW);
         let _ = io::stdout().flush();
