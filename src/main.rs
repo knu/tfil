@@ -10,7 +10,9 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use tfil::filters::{CursorShapeFilter, Filter, InkFakeCursorFilter, OscTitleFilter};
+use tfil::filters::{
+    CursorShapeFilter, Filter, InkFakeCursorFilter, OscTitleFilter, TmuxOscPassthroughFilter,
+};
 
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")");
 const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
@@ -33,6 +35,13 @@ struct Cli {
     /// Drop OSC 0/1/2 sequences (icon name and window title)
     #[arg(long)]
     strip_osc_titles: bool,
+
+    /// Wrap the given OSC sequences (comma-separated codes, e.g. "22"
+    /// or "22,52") in a tmux DCS passthrough so they reach the outer
+    /// terminal when running inside tmux (requires tmux 3.3+ with
+    /// `allow-passthrough on`)
+    #[arg(long, value_name = "CODES", value_delimiter = ',')]
+    tmux_osc_passthrough: Vec<u16>,
 
     /// Write the pre-filter PTY output stream to FILE for debugging.
     /// Defaults to TFIL_DEBUG_DUMP when set.
@@ -88,6 +97,11 @@ fn run(cli: Cli) -> Result<i32> {
     }
     if cli.strip_cursor_shape {
         filters.push(Box::new(CursorShapeFilter::new()));
+    }
+    if !cli.tmux_osc_passthrough.is_empty() {
+        filters.push(Box::new(TmuxOscPassthroughFilter::new(
+            cli.tmux_osc_passthrough.clone(),
+        )));
     }
 
     // Always put our stdin in raw mode: line editing is the slave PTY's
