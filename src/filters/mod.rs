@@ -9,10 +9,12 @@ use std::borrow::Cow;
 mod cursor_shape;
 mod ink_fake_cursor;
 mod osc_title;
+mod tmux_osc_passthrough;
 
 pub use cursor_shape::CursorShapeFilter;
 pub use ink_fake_cursor::InkFakeCursorFilter;
 pub use osc_title::OscTitleFilter;
+pub use tmux_osc_passthrough::{TmuxOscPassthroughFilter, tmux_wrap};
 
 /// Stateful byte-stream filter.
 ///
