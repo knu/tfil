@@ -61,14 +61,14 @@ Some terminals manage the pointer shape themselves while mouse tracking is activ
 
 ### Wrapper scripts
 
-`--create-wrapper=PATH` writes a small shell script that runs the command named after its basename through `tfil` with the given options, instead of running a command:
+`--create-wrapper=PATH` writes a small shell script that runs the command named after its basename through `tfil` with the given options, instead of running a command.  The recommended setup for Claude Code and Codex CLI is:
 
 ```console
 % tfil --create-wrapper=~/bin/claude --strip-ink-fake-cursor
-tfil: created /home/you/bin/claude
+% tfil --create-wrapper=~/bin/codex --codex-mouse-ui --tmux-osc-passthrough=22
 ```
 
-Typing `claude` then transparently runs the real `claude` under `tfil`.  The option is repeatable, so brace expansion creates several wrappers with the same options at once:
+Typing `claude` or `codex` then transparently runs the real command under `tfil` with the recommended enhancements.  The option is repeatable, so brace expansion creates several wrappers with the same options at once:
 
 ```console
 % tfil --create-wrapper=~/bin/{claude,gemini} --strip-ink-fake-cursor
