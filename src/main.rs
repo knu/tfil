@@ -23,7 +23,7 @@ const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
 #[command(
     name = "tfil",
     version = VERSION,
-    about = "Run a command through a configurable terminal output filter"
+    about = "Run a command through a PTY proxy that filters terminal sequences and enhances interactive TUIs"
 )]
 struct Cli {
     /// Drop DECSCUSR (cursor shape) sequences

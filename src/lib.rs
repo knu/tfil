@@ -1,9 +1,10 @@
-//! Terminal output filters used by the `tfil` PTY proxy.
+//! Terminal stream filters and UI enhancements for the `tfil` PTY proxy.
 //!
 //! The library exposes a small [`filters::Filter`] trait and a handful of
 //! implementations that rewrite escape sequences in a child process's
-//! output stream. Filters are independent and can be composed by running
-//! them in sequence.
+//! output stream.  Filters are independent and can be composed by running
+//! them in sequence.  [`codex_mouse_ui`] adds bidirectional mouse handling
+//! for Codex CLI's numbered menus.
 //!
 //! # Example
 //!

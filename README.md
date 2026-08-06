@@ -1,8 +1,8 @@
 # tfil
 
-A PTY proxy with configurable terminal output filters.
+A PTY proxy for filtering terminal sequences and enhancing interactive TUIs.
 
-`tfil` runs a command inside a pseudo-terminal and rewrites its output stream on the way back to your terminal.  Use it to clean up specific escape-sequence quirks emitted by interactive TUIs without modifying the program itself.
+`tfil` runs a command inside a pseudo-terminal and sits between the child process and your terminal.  It can clean up or relay selected escape sequences and add targeted input handling without modifying the child program.
 
 ## Installation
 
@@ -28,28 +28,40 @@ If you use `cargo-binstall`:
 % tfil [OPTIONS] <COMMAND> [ARGS]...
 ```
 
-With no filter flags, `tfil` is a transparent PTY proxy.  Each flag enables one filter on the output stream.  Hyphenated arguments after `<COMMAND>` are passed through to the child without needing `--`:
+With no behavior options, `tfil` is a transparent PTY proxy.  Options can be combined, and hyphenated arguments after `<COMMAND>` are passed through to the child:
 
 ```console
 % tfil --strip-ink-fake-cursor claude --resume
 ```
 
-### Filters
+### Output filters
 
 - `--strip-cursor-shape` — Drop DECSCUSR (`CSI Pn SP q`) so child programs cannot change the terminal's cursor shape.
 - `--strip-ink-fake-cursor` — Strip [Ink](https://github.com/vadimdemedes/ink)'s fake-cursor sequences (`\x1b[7m{grapheme}\x1b[27m` and friends), and suppress `\x1b[?25l` so the terminal's native cursor shows through.  Useful with Ink-based TUIs such as Claude Code, Gemini CLI, or ccmanager.
 - `--strip-osc-titles` — Drop OSC 0/1/2 sequences (icon name and window title).  Other OSCs (4 = palette, 8 = hyperlink, 52 = clipboard, ...) are passed through.  Both ST (`ESC \`) and BEL terminators are recognized.
-- `--codex-mouse-ui` — Make Codex CLI's `›`-marked numbered menus (approval prompts, question forms, ...) mouse-driven.  Unlike the other filters this one works on both streams: `tfil` maintains a screen model of the output and enables SGR any-motion mouse reporting.  Hovering over a numbered option steers Codex's own selection there with arrow keys, so the selection marker follows the mouse, and the mouse pointer takes a hand shape via OSC 22 on supporting terminals.  Clicking sends Enter to confirm the selection.  Mouse events the menu logic does not consume are forwarded to the child only when it has enabled a mouse protocol of its own.
+- `--tmux-osc-passthrough=CODES` — Wrap the OSC sequences with the given comma-separated codes in a tmux `DCS tmux; ... ST` passthrough so they reach the outer terminal instead of being swallowed by tmux.  Requires tmux 3.3+ with `allow-passthrough on` set.
+
+### Interactive enhancements
+
+`--codex-mouse-ui` makes Codex CLI's `›`-marked numbered menus, including approval prompts and question forms, mouse-driven.  `tfil` maintains a screen model of the output and enables SGR any-motion mouse reporting.  Hovering over a numbered option steers Codex's own selection there with arrow keys, so the selection marker follows the mouse, and the mouse pointer takes a hand shape via OSC 22 on supporting terminals.  Clicking sends Enter to confirm the selection.
+
+Mouse events the menu logic does not consume are forwarded only when the child has enabled a mouse protocol of its own, using the encoding requested by the child.
 
 ```console
 % tfil --codex-mouse-ui codex
 ```
 
-- `--tmux-osc-passthrough=CODES` — Wrap the OSC sequences with the given comma-separated codes in a tmux `DCS tmux; ... ST` passthrough so they reach the outer terminal instead of being swallowed by tmux.  Also applies to the OSC 22 pointer-shape updates emitted by `--codex-mouse-ui` when `22` is listed.  Requires tmux 3.3+ with `allow-passthrough on` set.  Note that some terminals manage the pointer shape themselves while mouse tracking is active (as tmux's `mouse on` does) and ignore OSC 22 in that state.
+To relay the OSC 22 pointer-shape updates through tmux, combine the mouse UI with `--tmux-osc-passthrough=22`:
 
 ```console
 % tfil --codex-mouse-ui --tmux-osc-passthrough=22 codex
 ```
+
+Some terminals manage the pointer shape themselves while mouse tracking is active, as tmux does with `mouse on`, and ignore OSC 22 in that state.
+
+### Debugging
+
+`--debug-dump=FILE` appends the unfiltered PTY output stream to a file.  Set `TFIL_DEBUG_DUMP` to use a default file without passing the option; an explicit `--debug-dump` takes precedence.
 
 ## Composition
 

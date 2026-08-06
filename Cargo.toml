@@ -4,11 +4,11 @@ version = "0.2.0"
 edition = "2024"
 authors = ["Akinori Musha <knu@idaemons.org>"]
 default-run = "tfil"
-description = "PTY proxy with configurable terminal output filters"
+description = "PTY proxy for filtering terminal sequences and enhancing interactive TUIs"
 license = "MIT"
 repository = "https://github.com/knu/tfil"
 readme = "README.md"
-keywords = ["pty", "terminal", "filter", "ink", "tui"]
+keywords = ["pty", "terminal", "tui", "codex", "claude"]
 categories = ["command-line-utilities"]
 
 [package.metadata.release]
