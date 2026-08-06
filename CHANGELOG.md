@@ -8,6 +8,16 @@ version bumps for fixes.  Once `1.0.0` ships, the project will revisit and
 likely adopt strict [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.2.1] - 2026-08-06
+
+### Added
+
+- Add --create-wrapper to generate wrapper scripts
+
+### Changed
+
+- Document current terminal proxy features
+
 ## [0.2.0] - 2026-08-05
 
 ### Added
