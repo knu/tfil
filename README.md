@@ -59,6 +59,25 @@ To relay the OSC 22 pointer-shape updates through tmux, combine the mouse UI wit
 
 Some terminals manage the pointer shape themselves while mouse tracking is active, as tmux does with `mouse on`, and ignore OSC 22 in that state.
 
+### Wrapper scripts
+
+`--create-wrapper=PATH` writes a small shell script that runs the command named after its basename through `tfil` with the given options, instead of running a command:
+
+```console
+% tfil --create-wrapper=~/bin/claude --strip-ink-fake-cursor
+tfil: created /home/you/bin/claude
+```
+
+Typing `claude` then transparently runs the real `claude` under `tfil`.  The option is repeatable, so brace expansion creates several wrappers with the same options at once:
+
+```console
+% tfil --create-wrapper=~/bin/{claude,gemini} --strip-ink-fake-cursor
+```
+
+The generated script calls `tfil --wrap="$0" [OPTIONS] -- "$@"`.  At run time `--wrap` takes the command name from the wrapper's basename and resolves it in `PATH`, skipping the wrapper itself (compared by device/inode) and any other `tfil` wrapper, so no infinite recursion occurs regardless of `PATH` order; when the real command is not found, the wrapper exits with status 127.  Because the script does not embed a command name, renaming or symlinking a wrapper retargets it: `ln -s claude ~/bin/gemini` yields a `gemini` wrapper with the same options.
+
+Positional arguments given after `--` with `--create-wrapper` are embedded as fixed leading arguments.  An existing file is only overwritten when it is a `tfil`-generated wrapper (recognized by its `# tfil-wrapper` marker line) or `--force` is given.  After writing, `tfil` warns when a wrapper is unreachable via `PATH` or shadowed by another executable.
+
 ### Debugging
 
 `--debug-dump=FILE` appends the unfiltered PTY output stream to a file.  Set `TFIL_DEBUG_DUMP` to use a default file without passing the option; an explicit `--debug-dump` takes precedence.

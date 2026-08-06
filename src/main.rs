@@ -16,6 +16,8 @@ use tfil::filters::{
     tmux_wrap,
 };
 
+mod wrapper;
+
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")");
 const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
 
@@ -56,17 +58,106 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     debug_dump: Option<PathBuf>,
 
+    /// Run as a wrapper: take the command name from SELF's basename,
+    /// resolve it in PATH skipping SELF and other tfil wrappers, and
+    /// treat all positional arguments as the command's arguments.
+    /// Exits 127 when the command cannot be found.  Meant to be
+    /// called from a wrapper script as: tfil --wrap="$0" [OPTIONS]
+    /// -- "$@"
+    #[arg(long, value_name = "SELF", conflicts_with = "create_wrapper")]
+    wrap: Option<PathBuf>,
+
+    /// Instead of running a command, write a wrapper script to PATH
+    /// that runs the command named after its basename through tfil
+    /// with the given options; positional arguments given after "--"
+    /// are embedded as fixed leading arguments.  May be given
+    /// multiple times.
+    #[arg(long, value_name = "PATH")]
+    create_wrapper: Vec<PathBuf>,
+
+    /// Overwrite existing files that are not tfil wrappers
+    #[arg(long, requires = "create_wrapper")]
+    force: bool,
+
     /// Command to run, for example "claude", "gemini", or "ccmanager"
-    command: String,
+    #[arg(required_unless_present_any = ["wrap", "create_wrapper"])]
+    command: Option<String>,
 
     /// Arguments to pass to the command
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
 }
 
+impl Cli {
+    /// Rebuild the behavior options as command-line arguments for
+    /// embedding into a wrapper script.
+    fn to_wrapper_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if self.strip_cursor_shape {
+            args.push("--strip-cursor-shape".to_string());
+        }
+        if self.strip_ink_fake_cursor {
+            args.push("--strip-ink-fake-cursor".to_string());
+        }
+        if self.strip_osc_titles {
+            args.push("--strip-osc-titles".to_string());
+        }
+        if self.codex_mouse_ui {
+            args.push("--codex-mouse-ui".to_string());
+        }
+        if !self.tmux_osc_passthrough.is_empty() {
+            let codes: Vec<String> = self
+                .tmux_osc_passthrough
+                .iter()
+                .map(u16::to_string)
+                .collect();
+            args.push(format!("--tmux-osc-passthrough={}", codes.join(",")));
+        }
+        if let Some(path) = &self.debug_dump {
+            args.push(format!("--debug-dump={}", path.display()));
+        }
+        args
+    }
+
+    /// Positional arguments: the command slot merged with the trailing
+    /// arguments, for modes where no command name is expected.
+    fn positional_args(&self) -> Vec<String> {
+        self.command.iter().chain(&self.args).cloned().collect()
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(cli) {
+
+    if !cli.create_wrapper.is_empty() {
+        return match wrapper::create_wrappers(
+            &cli.create_wrapper,
+            cli.force,
+            &cli.to_wrapper_args(),
+            &cli.positional_args(),
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("tfil: {:#}", e);
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    let (program, args) = if let Some(self_path) = &cli.wrap {
+        match wrapper::resolve_command(self_path) {
+            Ok(target) => (target, cli.positional_args()),
+            Err(e) => {
+                eprintln!("tfil: {:#}", e);
+                return ExitCode::from(127);
+            }
+        }
+    } else {
+        let command = cli.command.clone().expect("clap enforces command");
+        (PathBuf::from(command), cli.args.clone())
+    };
+
+    match run(cli, program, args) {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
             eprintln!("tfil: {:#}", e);
@@ -75,14 +166,14 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<i32> {
+fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(current_pty_size())
         .context("openpty failed")?;
 
-    let mut cmd = CommandBuilder::new(&cli.command);
-    for arg in &cli.args {
+    let mut cmd = CommandBuilder::new(&program);
+    for arg in &args {
         cmd.arg(arg);
     }
     if let Ok(cwd) = std::env::current_dir() {
@@ -397,5 +488,72 @@ mod tests {
         );
 
         assert_eq!(path.as_deref(), Some(Path::new("cli.dump")));
+    }
+
+    #[test]
+    fn wrapper_args_cover_all_behavior_options() {
+        use clap::CommandFactory;
+
+        // Options that configure wrapper handling itself, not child
+        // behavior, and thus are never embedded into a script.
+        const EXCLUDED: &[&str] = &["wrap", "create-wrapper", "force", "help", "version"];
+
+        let cli = Cli::parse_from([
+            "tfil",
+            "--strip-cursor-shape",
+            "--strip-ink-fake-cursor",
+            "--strip-osc-titles",
+            "--codex-mouse-ui",
+            "--tmux-osc-passthrough=22,52",
+            "--debug-dump=dump.log",
+            "cmd",
+        ]);
+        let args = cli.to_wrapper_args();
+
+        for arg in Cli::command().get_arguments() {
+            if arg.is_positional() {
+                continue;
+            }
+            let long = arg.get_long().expect("all options have long names");
+            if EXCLUDED.contains(&long) {
+                continue;
+            }
+            assert!(
+                args.iter()
+                    .any(|a| *a == format!("--{long}") || a.starts_with(&format!("--{long}="))),
+                "--{long} is not covered; update to_wrapper_args() and this test's argv"
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_mode_treats_all_positionals_as_child_args() {
+        let cli = Cli::parse_from(["tfil", "--wrap=/home/u/bin/claude", "--", "--resume", "x"]);
+
+        assert_eq!(cli.command.as_deref(), Some("--resume"));
+        assert_eq!(cli.args, ["x"]);
+        assert_eq!(cli.positional_args(), ["--resume", "x"]);
+    }
+
+    #[test]
+    fn wrap_conflicts_with_create_wrapper() {
+        let result = Cli::try_parse_from([
+            "tfil",
+            "--wrap=/home/u/bin/claude",
+            "--create-wrapper=/home/u/bin/claude",
+        ]);
+
+        assert_eq!(
+            result.unwrap_err().kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn wrap_mode_accepts_no_positionals() {
+        let cli = Cli::parse_from(["tfil", "--wrap=/home/u/bin/claude", "--"]);
+
+        assert_eq!(cli.command, None);
+        assert!(cli.positional_args().is_empty());
     }
 }
