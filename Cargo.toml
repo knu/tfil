@@ -31,7 +31,7 @@ clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 memchr = "2"
 portable-pty = "0.9"
-shlex = "1"
+shlex = "2"
 signal-hook = "0.4"
 unicode-segmentation = "1"
 vt100 = "0.16.2"
