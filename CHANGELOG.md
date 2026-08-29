@@ -8,6 +8,12 @@ version bumps for fixes.  Once `1.0.0` ships, the project will revisit and
 likely adopt strict [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.2.3] - 2026-08-29
+
+### Changed
+
+- Bypass PTY for noninteractive wrappers
+
 ## [0.2.2] - 2026-08-29
 
 ### Changed
