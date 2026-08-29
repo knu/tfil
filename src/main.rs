@@ -4,7 +4,8 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
 use std::ffi::OsString;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -144,6 +145,11 @@ fn main() -> ExitCode {
         };
     }
 
+    let bypass_pty = should_bypass_pty(
+        cli.wrap.is_some(),
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+    );
     let (program, args) = if let Some(self_path) = &cli.wrap {
         match wrapper::resolve_command(self_path) {
             Ok(target) => (target, cli.positional_args()),
@@ -157,6 +163,12 @@ fn main() -> ExitCode {
         (PathBuf::from(command), cli.args.clone())
     };
 
+    if bypass_pty {
+        let error = std::process::Command::new(&program).args(&args).exec();
+        eprintln!("tfil: {}: exec failed: {}", program.display(), error);
+        return ExitCode::from(126);
+    }
+
     match run(cli, program, args) {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
@@ -164,6 +176,10 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn should_bypass_pty(wrap: bool, stdin_tty: bool, stdout_tty: bool) -> bool {
+    wrap && (!stdin_tty || !stdout_tty)
 }
 
 fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
@@ -552,5 +568,13 @@ mod tests {
 
         assert_eq!(cli.command, None);
         assert!(cli.positional_args().is_empty());
+    }
+
+    #[test]
+    fn wrapper_bypasses_pty_when_standard_io_is_not_a_terminal() {
+        assert!(should_bypass_pty(true, false, true));
+        assert!(should_bypass_pty(true, true, false));
+        assert!(!should_bypass_pty(true, true, true));
+        assert!(!should_bypass_pty(false, false, false));
     }
 }

@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 #[test]
-fn generated_wrapper_runs_target_through_tfil() {
+fn generated_wrapper_bypasses_pty_for_non_terminal_io() {
     let tfil = Path::new(env!("CARGO_BIN_EXE_tfil"));
     let tmp = tempfile::tempdir().unwrap();
     let bin_dir = tmp.path().join("bin");
@@ -13,7 +13,11 @@ fn generated_wrapper_runs_target_through_tfil() {
     fs::create_dir(&real_dir).unwrap();
 
     let target = real_dir.join("hello");
-    fs::write(&target, "#!/bin/sh\necho hello-from-target \"$@\"\n").unwrap();
+    fs::write(
+        &target,
+        "#!/bin/sh\nprintf 'hello-from-target %s\\n' \"$1\"\nprintf 'target warning\\n' >&2\n",
+    )
+    .unwrap();
     fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
 
     let path_var = std::env::join_paths([
@@ -38,20 +42,21 @@ fn generated_wrapper_runs_target_through_tfil() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // The wrapper resolves its basename in PATH, skipping itself, and
-    // runs the real command through tfil's PTY proxy.
+    // Piped standard I/O bypasses the PTY so newlines and the separation
+    // between stdout and stderr remain intact.
     let output = Command::new(&wrapper)
         .arg("world")
         .env("PATH", &path_var)
         .stdin(Stdio::null())
         .output()
         .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "wrapper failed: {stdout}");
     assert!(
-        stdout.contains("hello-from-target world"),
-        "unexpected output: {stdout}"
+        output.status.success(),
+        "wrapper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(output.stdout, b"hello-from-target world\n");
+    assert_eq!(output.stderr, b"target warning\n");
 }
 
 #[test]
