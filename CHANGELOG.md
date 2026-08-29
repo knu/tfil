@@ -8,6 +8,16 @@ version bumps for fixes.  Once `1.0.0` ships, the project will revisit and
 likely adopt strict [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.2.2] - 2026-08-29
+
+### Changed
+
+- Recommend Claude and Codex wrapper setups
+
+### Fixed
+
+- Fix terminal output from `codex completion`
+
 ## [0.2.1] - 2026-08-06
 
 ### Added
