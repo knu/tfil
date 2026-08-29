@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use tfil::codex_mouse_ui::{CodexMouseUi, MOUSE_DISABLE, MOUSE_ENABLE, POINTER_OFF};
+use tfil::codex_mouse_ui::{CodexMouseUi, MOUSE_DISABLE, POINTER_OFF};
 use tfil::filters::{
     CursorShapeFilter, Filter, InkFakeCursorFilter, OscTitleFilter, TmuxOscPassthroughFilter,
     tmux_wrap,
@@ -217,12 +217,6 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
     let _raw_guard = RawModeGuard::enter()?;
     let done = Arc::new(AtomicBool::new(false));
 
-    if mouse.is_some() {
-        let mut lock = io::stdout().lock();
-        let _ = lock.write_all(MOUSE_ENABLE);
-        let _ = lock.flush();
-    }
-
     // child -> filter -> stdout
     let debug_dump = debug_dump_path(cli.debug_dump.as_deref());
     let stdout_thread = {
@@ -338,7 +332,10 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
     done.store(true, Ordering::SeqCst);
     let _ = stdout_thread.join();
 
-    if cli.codex_mouse_ui {
+    let mouse_active = mouse
+        .as_ref()
+        .is_some_and(|mouse| mouse.lock().unwrap().is_active());
+    if mouse_active {
         let mut lock = io::stdout().lock();
         let _ = lock.write_all(MOUSE_DISABLE);
         if tmux_pointer {

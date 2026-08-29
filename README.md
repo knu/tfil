@@ -43,7 +43,7 @@ With no behavior options, `tfil` is a transparent PTY proxy.  Options can be com
 
 ### Interactive enhancements
 
-`--codex-mouse-ui` makes Codex CLI's `›`-marked numbered menus, including approval prompts and question forms, mouse-driven.  `tfil` maintains a screen model of the output and enables SGR any-motion mouse reporting.  Hovering over a numbered option steers Codex's own selection there with arrow keys, so the selection marker follows the mouse, and the mouse pointer takes a hand shape via OSC 22 on supporting terminals.  Clicking sends Enter to confirm the selection.
+`--codex-mouse-ui` makes Codex CLI's `›`-marked numbered menus, including approval prompts and question forms, mouse-driven.  When Codex starts its interactive TUI and enables bracketed paste, `tfil` begins maintaining a screen model of the output and enables SGR any-motion mouse reporting.  Non-interactive commands do not emit mouse-reporting sequences.  Hovering over a numbered option steers Codex's own selection there with arrow keys, so the selection marker follows the mouse, and the mouse pointer takes a hand shape via OSC 22 on supporting terminals.  Clicking sends Enter to confirm the selection.
 
 Mouse events the menu logic does not consume are forwarded only when the child has enabled a mouse protocol of its own, using the encoding requested by the child.
 

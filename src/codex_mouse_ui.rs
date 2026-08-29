@@ -1,7 +1,8 @@
 //! Mouse support for Codex CLI's marker-based numbered menus.
 //!
 //! [`CodexMouseUi`] sits on both sides of the PTY proxy.  On the output
-//! side it maintains a [`vt100`] screen model of what the terminal
+//! side it waits for Codex to enter its interactive bracketed-paste
+//! mode, then maintains a [`vt100`] screen model of what the terminal
 //! displays and keeps SGR any-motion mouse reporting enabled.  On the
 //! input side it intercepts SGR mouse reports from the terminal:
 //! hovering over a `›`/`❯`-marked numbered option steers the child's
@@ -29,6 +30,9 @@ const ARROW_UP: &[u8] = b"\x1b[A";
 const ARROW_DOWN: &[u8] = b"\x1b[B";
 const APP_ARROW_UP: &[u8] = b"\x1bOA";
 const APP_ARROW_DOWN: &[u8] = b"\x1bOB";
+
+/// Codex enables bracketed paste when its interactive TUI starts.
+const INTERACTIVE_ENABLE: &[u8] = b"\x1b[?2004h";
 
 /// Any DECSET/DECRST touching modes 10xx (mouse protocols, alternate
 /// screen, ...) starts with this prefix; seeing one in the child's
@@ -60,7 +64,9 @@ pub struct CodexMouseUi {
     steered_row: Option<usize>,
     /// Wrap pointer-shape OSCs in a tmux DCS passthrough.
     tmux_pointer: bool,
+    active: bool,
     prev_modes: (MouseProtocolMode, MouseProtocolEncoding, bool),
+    interactive_scan_carry: Vec<u8>,
     scan_carry: Vec<u8>,
 }
 
@@ -76,7 +82,9 @@ impl CodexMouseUi {
             swallow_release: false,
             steered_row: None,
             tmux_pointer: false,
+            active: false,
             prev_modes: Default::default(),
+            interactive_scan_carry: Vec::new(),
             scan_carry: Vec::new(),
         }
     }
@@ -92,6 +100,11 @@ impl CodexMouseUi {
         self.tmux_pointer = on;
     }
 
+    /// Reports whether Codex has started its interactive TUI.
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
     /// Feeds a chunk of child output (as written to the terminal) into
     /// the screen model.  Returns bytes to append to the terminal
     /// output: mouse-mode re-assertions and pointer shape updates.
@@ -104,10 +117,16 @@ impl CodexMouseUi {
             screen.mouse_protocol_encoding(),
             screen.alternate_screen(),
         );
-        if self.scan_mode_prefix(chunk) || modes != self.prev_modes {
+        let activated = !self.active
+            && scan_sequence(&mut self.interactive_scan_carry, chunk, INTERACTIVE_ENABLE);
+        self.active |= activated;
+        if self.active && (activated || self.scan_mode_prefix(chunk) || modes != self.prev_modes) {
             out.extend_from_slice(MOUSE_ENABLE);
         }
         self.prev_modes = modes;
+        if !self.active {
+            return out;
+        }
         // The content under a stationary mouse may have changed.
         self.update_pointer(&mut out);
         out
@@ -117,6 +136,9 @@ impl CodexMouseUi {
     /// bytes to forward to the child and bytes (pointer shape updates)
     /// to write back to the terminal.
     pub fn on_input(&mut self, chunk: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        if !self.active {
+            return (chunk.to_vec(), Vec::new());
+        }
         let mut to_child = Vec::new();
         let mut to_term = Vec::new();
         for &byte in chunk {
@@ -318,15 +340,19 @@ impl CodexMouseUi {
     /// Reports whether `chunk` (or its boundary with the previous
     /// chunk) contains a `CSI ? 10..` mode change.
     fn scan_mode_prefix(&mut self, chunk: &[u8]) -> bool {
-        let mut boundary = std::mem::take(&mut self.scan_carry);
-        boundary.extend_from_slice(&chunk[..chunk.len().min(MODE_PREFIX.len() - 1)]);
-        let found = memchr::memmem::find(&boundary, MODE_PREFIX).is_some()
-            || memchr::memmem::find(chunk, MODE_PREFIX).is_some();
-        boundary.extend_from_slice(&chunk[chunk.len().min(MODE_PREFIX.len() - 1)..]);
-        let tail = boundary.len().saturating_sub(MODE_PREFIX.len() - 1);
-        self.scan_carry = boundary.split_off(tail);
-        found
+        scan_sequence(&mut self.scan_carry, chunk, MODE_PREFIX)
     }
+}
+
+fn scan_sequence(carry: &mut Vec<u8>, chunk: &[u8], sequence: &[u8]) -> bool {
+    let mut boundary = std::mem::take(carry);
+    boundary.extend_from_slice(&chunk[..chunk.len().min(sequence.len() - 1)]);
+    let found = memchr::memmem::find(&boundary, sequence).is_some()
+        || memchr::memmem::find(chunk, sequence).is_some();
+    boundary.extend_from_slice(&chunk[chunk.len().min(sequence.len() - 1)..]);
+    let tail = boundary.len().saturating_sub(sequence.len() - 1);
+    *carry = boundary.split_off(tail);
+    found
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -517,6 +543,7 @@ mod tests {
 
     fn menu() -> CodexMouseUi {
         let mut m = CodexMouseUi::new(24, 100);
+        m.on_output(INTERACTIVE_ENABLE);
         m.on_output(CODEX_MENU.as_bytes());
         m
     }
@@ -755,6 +782,28 @@ mod tests {
         assert_eq!(to_child, b"hello\x1b[A\x1bOP\x1b");
         assert_eq!(to_term, b"");
         assert_eq!(m.finish_input(), b"\x1b");
+    }
+
+    #[test]
+    fn waits_for_interactive_session_before_enabling_mouse() {
+        let mut m = CodexMouseUi::new(24, 100);
+        assert_eq!(m.on_output(b"codex-cli 0.150.1\r\n"), b"");
+        assert!(!m.is_active());
+
+        let input = sgr(0, 3, 7, false);
+        assert_eq!(m.on_input(&input), (input, Vec::new()));
+
+        assert_eq!(m.on_output(INTERACTIVE_ENABLE), MOUSE_ENABLE);
+        assert!(m.is_active());
+    }
+
+    #[test]
+    fn interactive_sequence_split_across_chunks_enables_mouse() {
+        let mut m = CodexMouseUi::new(24, 100);
+        let split = INTERACTIVE_ENABLE.len() - 2;
+        assert_eq!(m.on_output(&INTERACTIVE_ENABLE[..split]), b"");
+        assert_eq!(m.on_output(&INTERACTIVE_ENABLE[split..]), MOUSE_ENABLE);
+        assert!(m.is_active());
     }
 
     #[test]
