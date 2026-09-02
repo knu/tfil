@@ -74,7 +74,7 @@ impl CodexMouseUi {
     /// Creates a handler for a terminal of the given size.
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
-            parser: vt100::Parser::new(rows, cols, 0),
+            parser: vt100::Parser::new(rows.max(1), cols.max(2), 0),
             state: InState::default(),
             pending: Vec::new(),
             last_pos: None,
@@ -91,7 +91,7 @@ impl CodexMouseUi {
 
     /// Resizes the screen model (call on SIGWINCH).
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.parser.screen_mut().set_size(rows, cols);
+        self.parser.screen_mut().set_size(rows.max(1), cols.max(2));
     }
 
     /// Emits pointer-shape OSCs wrapped in a tmux DCS passthrough so
@@ -845,6 +845,15 @@ mod tests {
         let out = m.on_output(b"004h more");
         let hit2 = out.windows(MOUSE_ENABLE.len()).any(|w| w == MOUSE_ENABLE);
         assert!(hit1 || hit2);
+    }
+
+    #[test]
+    fn one_column_resize_accepts_wide_characters() {
+        let mut m = CodexMouseUi::new(24, 100);
+        m.resize(24, 1);
+        m.on_output("›".as_bytes());
+
+        assert_eq!(m.parser.screen().size(), (24, 2));
     }
 
     #[test]
