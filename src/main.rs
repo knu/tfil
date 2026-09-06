@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use tfil::codex_mouse_ui::{CodexMouseUi, MOUSE_DISABLE, POINTER_OFF};
 use tfil::filters::{
-    CursorShapeFilter, Filter, InkFakeCursorFilter, OscTitleFilter, TmuxOscPassthroughFilter,
-    tmux_wrap,
+    CursorShapeFilter, Filter, FilterChain, InkFakeCursorFilter, OscTitleFilter,
+    TmuxOscPassthroughFilter, tmux_wrap,
 };
 
 mod terminal_output;
@@ -231,6 +231,7 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
         )));
     }
     let tmux_pointer = cli.tmux_osc_passthrough.contains(&22);
+    let filters = FilterChain::new(filters);
 
     let mouse = cli.codex_mouse_ui.then(|| {
         let size = current_pty_size();
@@ -260,7 +261,6 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
         thread::spawn(move || -> Result<()> {
             let mut filters = filters;
             let mut buf = [0u8; 65536];
-            let mut owned: Vec<u8> = Vec::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
@@ -269,18 +269,18 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
                             let _ = f.write_all(&buf[..n]);
                             let _ = f.flush();
                         }
-                        let out = run_filters(&mut filters, &buf[..n], &mut owned);
+                        let out = filters.filter(&buf[..n]);
                         let extra = mouse
                             .as_ref()
-                            .map(|m| m.lock().unwrap().on_output(out))
+                            .map(|m| m.lock().unwrap().on_output(&out))
                             .unwrap_or_default();
-                        terminal.lock().unwrap().write_child(out, &extra)?;
+                        terminal.lock().unwrap().write_child(&out, &extra)?;
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
             }
-            let pending = flush_filters(&mut filters);
+            let pending = filters.finish();
             if !pending.is_empty() {
                 terminal.lock().unwrap().write_child(&pending, &[])?;
             }
@@ -377,36 +377,6 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
     Ok(status.exit_code() as i32)
 }
 
-fn run_filters<'a>(
-    filters: &mut [Box<dyn Filter + Send>],
-    data: &'a [u8],
-    owned: &'a mut Vec<u8>,
-) -> &'a [u8] {
-    if filters.is_empty() {
-        return data;
-    }
-    let mut current: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Borrowed(data);
-    for f in filters.iter_mut() {
-        let next = f.filter(current.as_ref());
-        current = std::borrow::Cow::Owned(next.into_owned());
-    }
-    owned.clear();
-    owned.extend_from_slice(current.as_ref());
-    owned.as_slice()
-}
-
-fn flush_filters(filters: &mut [Box<dyn Filter + Send>]) -> Vec<u8> {
-    let mut tail = Vec::new();
-    for f in filters.iter_mut() {
-        // Upstream tails are later input for downstream filters, which may
-        // still hold earlier bytes and may need to transform the tail.
-        let mut out = f.filter(&tail).into_owned();
-        out.extend_from_slice(&f.finish());
-        tail = out;
-    }
-    tail
-}
-
 fn current_pty_size() -> PtySize {
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
@@ -494,49 +464,6 @@ impl Drop for RawModeGuard {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-
-    fn all_filters() -> Vec<Box<dyn Filter + Send>> {
-        vec![
-            Box::new(InkFakeCursorFilter::new()),
-            Box::new(OscTitleFilter::new()),
-            Box::new(CursorShapeFilter::new()),
-            Box::new(TmuxOscPassthroughFilter::new(vec![22])),
-        ]
-    }
-
-    #[test]
-    fn filter_chain_preserves_order_and_transforms_at_every_split() {
-        let input = b"\x1b[1;7m \x1b[27m\x1b[5 q\x1b]0;title\x07\x1b]22;pointer\x07";
-        let expected = [b"\x1b[1m ".as_slice(), &tmux_wrap(b"\x1b]22;pointer\x07")].concat();
-        for split in 0..=input.len() {
-            let mut filters = all_filters();
-            let mut scratch = Vec::new();
-            let mut output = run_filters(&mut filters, &input[..split], &mut scratch).to_vec();
-            output.extend_from_slice(run_filters(&mut filters, &input[split..], &mut scratch));
-            output.extend(flush_filters(&mut filters));
-            assert_eq!(output, expected, "split {split}");
-        }
-    }
-
-    #[test]
-    fn filter_chain_flushes_upstream_tails_through_downstream_filters() {
-        for input in [
-            b"\x1b]22;pointer\x1b".as_slice(),
-            b"\x1b[7m ",
-            b"\x1b[7m \x1b]22;pointer\x07",
-        ] {
-            let mut filters = all_filters();
-            let mut scratch = Vec::new();
-            let mut output = run_filters(&mut filters, input, &mut scratch).to_vec();
-            output.extend(flush_filters(&mut filters));
-            let expected = if input.ends_with(b"\x07") {
-                [b"\x1b[7m ".as_slice(), &tmux_wrap(b"\x1b]22;pointer\x07")].concat()
-            } else {
-                input.to_vec()
-            };
-            assert_eq!(output, expected, "{input:?}");
-        }
-    }
 
     #[test]
     fn debug_dump_path_uses_env_when_cli_is_absent() {

@@ -6,11 +6,13 @@
 
 use std::borrow::Cow;
 
+mod chain;
 mod cursor_shape;
 mod ink_fake_cursor;
 mod osc_title;
 mod tmux_osc_passthrough;
 
+pub use chain::FilterChain;
 pub use cursor_shape::CursorShapeFilter;
 pub use ink_fake_cursor::InkFakeCursorFilter;
 pub use osc_title::OscTitleFilter;
