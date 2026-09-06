@@ -169,6 +169,70 @@ struct Ports {
     resize: Receiver<()>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputState {
+    Reading,
+    Draining,
+    FinishQueued,
+}
+
+impl OutputState {
+    fn close(&mut self) {
+        if *self == Self::Reading {
+            *self = Self::Draining;
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputState {
+    Reading,
+    Draining,
+    CloseQueued,
+    Closed,
+}
+
+impl InputState {
+    fn close(&mut self) {
+        if *self == Self::Reading {
+            *self = Self::Draining;
+        }
+    }
+}
+
+#[derive(Default)]
+struct Workers {
+    disconnected: u8,
+    completed: u8,
+    terminal_result: Option<Result<()>>,
+}
+
+impl Workers {
+    fn disconnected(&self, worker: Worker) -> bool {
+        self.disconnected & (1 << worker as u8) != 0
+    }
+
+    fn completed(&self, worker: Worker) -> bool {
+        self.completed & (1 << worker as u8) != 0
+    }
+
+    fn disconnect(&mut self, worker: Worker) {
+        self.disconnected |= 1 << worker as u8;
+    }
+
+    fn complete(&mut self, worker: Worker) {
+        self.completed |= 1 << worker as u8;
+    }
+
+    fn take_result(&mut self) -> Option<Result<()>> {
+        if self.disconnected & !self.completed == 0 {
+            self.terminal_result.take()
+        } else {
+            None
+        }
+    }
+}
+
 struct Coordinator {
     mouse: Option<CodexMouseUi>,
     restore_cursor: bool,
@@ -176,9 +240,8 @@ struct Coordinator {
     pending_terminal: Option<TerminalCommand>,
     pending_controls: Option<Vec<u8>>,
     pending_child: Option<InputCommand>,
-    output_eof: bool,
-    input_eof: bool,
-    finish_sent: bool,
+    output: OutputState,
+    input: InputState,
     error: Option<anyhow::Error>,
 }
 
@@ -191,9 +254,8 @@ impl Coordinator {
             pending_terminal: None,
             pending_controls: None,
             pending_child: None,
-            output_eof: false,
-            input_eof: false,
-            finish_sent: false,
+            output: OutputState::Reading,
+            input: InputState::Reading,
             error: None,
         }
     }
@@ -224,7 +286,7 @@ impl Coordinator {
                     .unwrap_or_default();
                 self.pending_terminal = Some(TerminalCommand::Output { bytes, extra });
             }
-            ReadEvent::Eof => self.output_eof = true,
+            ReadEvent::Eof => self.output.close(),
         }
     }
 
@@ -244,7 +306,7 @@ impl Coordinator {
                 }
             }
             ReadEvent::Eof => {
-                self.input_eof = true;
+                self.input.close();
                 let tail = self
                     .mouse
                     .as_mut()
@@ -257,6 +319,63 @@ impl Coordinator {
         }
     }
 
+    fn prepare_commands(&mut self, stop: &mut Option<Sender<()>>) {
+        if self.pending_terminal.is_none() {
+            self.pending_terminal = self.pending_controls.take().map(TerminalCommand::Controls);
+        }
+        if self.output != OutputState::Reading {
+            stop.take();
+            self.input.close();
+            if self.pending_terminal.is_none() && self.output == OutputState::Draining {
+                self.pending_terminal = Some(TerminalCommand::Finish(self.cleanup()));
+                self.output = OutputState::FinishQueued;
+            }
+        }
+        if self.input == InputState::Draining && self.pending_child.is_none() {
+            self.pending_child = Some(InputCommand::Eof);
+            self.input = InputState::CloseQueued;
+        }
+    }
+
+    fn record_error(&mut self, error: anyhow::Error, abort: &mut impl FnMut()) {
+        if self.error.is_none() {
+            self.error = Some(error);
+            abort();
+        }
+    }
+
+    fn on_completion(
+        &mut self,
+        Completion { worker, result }: Completion,
+        workers: &mut Workers,
+        abort: &mut impl FnMut(),
+    ) -> Result<()> {
+        workers.complete(worker);
+        if worker == Worker::TerminalWriter {
+            if result.is_err() {
+                abort();
+            }
+            workers.terminal_result = Some(result);
+            return Ok(());
+        }
+        if worker == Worker::ChildWriter {
+            self.input = InputState::Closed;
+            self.pending_child = None;
+        }
+        if worker == Worker::OutputReader {
+            if workers.disconnected(worker) {
+                self.output.close();
+            }
+            if let Err(error) = result {
+                self.record_error(error, abort);
+            }
+            // Its sender is gone, but previously queued bytes still precede
+            // cleanup.  Drain them before observing disconnect.
+            return Ok(());
+        }
+        result
+    }
+
     fn run(
         mut self,
         ports: Ports,
@@ -265,90 +384,48 @@ impl Coordinator {
         mut abort: impl FnMut(),
     ) -> Result<()> {
         let mut stop = Some(stop);
-        let mut child_closed = false;
         let mut resize_closed = false;
-        let mut disconnected = 0u8;
-        let mut completed_workers = 0u8;
-        let mut terminal_result = None;
+        let mut workers = Workers::default();
         loop {
-            if disconnected & !completed_workers == 0
-                && let Some(result) = terminal_result.take()
-            {
+            if let Some(result) = workers.take_result() {
                 return self.error.map_or(result, Err);
             }
-            if self.pending_terminal.is_none() {
-                self.pending_terminal = self.pending_controls.take().map(TerminalCommand::Controls);
-            }
-            if self.output_eof {
-                stop.take();
-                self.input_eof = true;
-                if self.pending_terminal.is_none() && !self.finish_sent {
-                    self.pending_terminal = Some(TerminalCommand::Finish(self.cleanup()));
-                    self.finish_sent = true;
-                }
-            }
-            if self.input_eof && self.pending_child.is_none() && !child_closed {
-                self.pending_child = Some(InputCommand::Eof);
-                child_closed = true;
-            }
+            self.prepare_commands(&mut stop);
 
             let mut select = Select::new();
             let completed = select.recv(&ports.completed);
-            let output = (!self.output_eof
-                && disconnected & (1 << Worker::OutputReader as u8) == 0
+            let output = (self.output == OutputState::Reading
+                && !workers.disconnected(Worker::OutputReader)
                 && self.pending_terminal.is_none())
             .then(|| select.recv(&ports.output));
-            let input = (!self.input_eof
+            let input = (self.input == InputState::Reading
                 && self.pending_controls.is_none()
                 && self.pending_child.is_none())
             .then(|| select.recv(&ports.input));
             let terminal = (self.pending_terminal.is_some()
-                && disconnected & (1 << Worker::TerminalWriter as u8) == 0)
-                .then(|| select.send(&ports.terminal));
+                && !workers.disconnected(Worker::TerminalWriter))
+            .then(|| select.send(&ports.terminal));
             let child = self
                 .pending_child
                 .is_some()
                 .then(|| select.send(&ports.child));
-            let resized = (!resize_closed && !self.output_eof).then(|| select.recv(&ports.resize));
+            let resized = (!resize_closed && self.output == OutputState::Reading)
+                .then(|| select.recv(&ports.resize));
             let operation = select.select();
             let index = operation.index();
             let outcome = if index == completed {
-                let Completion { worker, result } = operation
+                let notice = operation
                     .recv(&ports.completed)
                     .context("worker notifications disconnected")?;
-                completed_workers |= 1 << worker as u8;
-                if worker == Worker::TerminalWriter {
-                    if result.is_err() {
-                        abort();
-                    }
-                    terminal_result = Some(result);
-                    continue;
-                }
-                if worker == Worker::OutputReader && disconnected & (1 << worker as u8) != 0 {
-                    self.output_eof = true;
-                }
-                if worker == Worker::ChildWriter {
-                    child_closed = true;
-                    self.input_eof = true;
-                    self.pending_child = None;
-                }
-                if worker == Worker::OutputReader && result.is_err() {
-                    if self.error.is_none() {
-                        self.error = result.err();
-                        abort();
-                    }
-                    // Its sender is gone, but previously queued bytes still
-                    // precede cleanup.  Drain them before observing disconnect.
-                    continue;
-                }
-                result
+                self.on_completion(notice, &mut workers, &mut abort)
             } else if Some(index) == output {
                 match operation.recv(&ports.output) {
                     Ok(event) => self.on_output(event),
                     Err(_) => {
-                        disconnected |= 1 << Worker::OutputReader as u8;
-                        self.output_eof =
-                            completed_workers & (1 << Worker::OutputReader as u8) != 0;
+                        workers.disconnect(Worker::OutputReader);
+                        if workers.completed(Worker::OutputReader) {
+                            self.output.close();
+                        }
                     }
                 }
                 Ok(())
@@ -356,8 +433,8 @@ impl Coordinator {
                 match operation.recv(&ports.input) {
                     Ok(event) => self.on_input(event),
                     Err(_) => {
-                        disconnected |= 1 << Worker::InputReader as u8;
-                        self.input_eof = true;
+                        workers.disconnect(Worker::InputReader);
+                        self.input.close();
                     }
                 }
                 Ok(())
@@ -366,7 +443,7 @@ impl Coordinator {
                     .send(&ports.terminal, self.pending_terminal.take().unwrap())
                     .is_err()
                 {
-                    disconnected |= 1 << Worker::TerminalWriter as u8;
+                    workers.disconnect(Worker::TerminalWriter);
                 }
                 Ok(())
             } else if Some(index) == child {
@@ -374,9 +451,8 @@ impl Coordinator {
                     .send(&ports.child, self.pending_child.take().unwrap())
                     .is_err()
                 {
-                    disconnected |= 1 << Worker::ChildWriter as u8;
-                    child_closed = true;
-                    self.input_eof = true;
+                    workers.disconnect(Worker::ChildWriter);
+                    self.input = InputState::Closed;
                 }
                 Ok(())
             } else if Some(index) == resized {
@@ -393,11 +469,8 @@ impl Coordinator {
                 unreachable!()
             };
             if let Err(error) = outcome {
-                if self.error.is_none() {
-                    self.error = Some(error);
-                    abort();
-                }
-                self.output_eof = true;
+                self.record_error(error, &mut abort);
+                self.output.close();
             }
         }
     }
@@ -828,7 +901,7 @@ mod tests {
             }
         }
         assert_eq!(output, input);
-        assert!(coordinator.output_eof);
+        assert!(coordinator.output != OutputState::Reading);
         assert!(coordinator.cleanup().starts_with(MOUSE_DISABLE));
     }
 
