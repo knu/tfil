@@ -7,11 +7,13 @@ const MAX_PENDING_CONTROLS: usize = 1024;
 
 /// Writes child output and synthetic controls in stream order.  Controls must
 /// wait for a complete escape sequence or UTF-8 character.
+/// Call `flush` before waiting for more commands.
 pub(crate) struct TerminalOutput<W> {
     writer: W,
     parser: Option<SequenceTracker>,
     pending: Vec<u8>,
     finished: bool,
+    write_failed: bool,
 }
 
 impl<W: Write> TerminalOutput<W> {
@@ -21,6 +23,7 @@ impl<W: Write> TerminalOutput<W> {
             parser: track_sequences.then(SequenceTracker::new),
             pending: Vec::new(),
             finished: false,
+            write_failed: false,
         }
     }
 
@@ -62,7 +65,21 @@ impl<W: Write> TerminalOutput<W> {
             }
             self.pending.extend_from_slice(bytes);
         }
+        Ok(())
+    }
+
+    pub(crate) fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
+    }
+
+    pub(crate) fn writer_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
+
+    pub(crate) fn mark_write_failed(&mut self) {
+        // A partial write can stop inside a sequence even if the whole batch
+        // was parsed through its final boundary.
+        self.write_failed = true;
     }
 
     /// Ends the child stream and restores terminal modes.  Queued controls must
@@ -73,7 +90,7 @@ impl<W: Write> TerminalOutput<W> {
         }
         self.finished = true;
         self.pending.clear();
-        if self.parser.as_ref().is_some_and(|p| !p.is_ground()) {
+        if self.write_failed || self.parser.as_ref().is_some_and(|p| !p.is_ground()) {
             // CAN cancels ordinary sequences and incomplete UTF-8.  tmux DCS
             // treats CAN as payload, so also send ST; the leading CAN consumes
             // any dangling DCS escape, and the trailing CAN cancels its payload.

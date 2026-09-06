@@ -18,6 +18,7 @@ use tfil::filters::{Filter, FilterChain, tmux_wrap};
 
 const CHUNK_SIZE: usize = 65536;
 const QUEUE_CAPACITY: usize = 8;
+const MAX_OUTPUT_BATCH: usize = 8;
 const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
 
 pub(crate) struct Options {
@@ -37,6 +38,15 @@ enum TerminalCommand {
     Output { bytes: Vec<u8>, extra: Vec<u8> },
     Controls(Vec<u8>),
     Finish(Vec<u8>),
+}
+
+impl TerminalCommand {
+    fn byte_len(&self) -> usize {
+        match self {
+            Self::Output { bytes, extra } => bytes.len() + extra.len(),
+            Self::Controls(bytes) | Self::Finish(bytes) => bytes.len(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -605,33 +615,111 @@ fn write_terminal(
     recycle: Sender<Vec<u8>>,
     mut report_failure: impl FnMut(anyhow::Error),
 ) -> Result<()> {
-    let mut terminal = TerminalOutput::new(writer, track_sequences);
+    let mut terminal = TerminalOutput::new(OutputBuffer::new(writer), track_sequences);
     let mut failed = false;
-    for command in rx {
-        let result = match command {
-            TerminalCommand::Finish(bytes) => {
-                return terminal.finish(&bytes).context("restore terminal modes");
+    let mut next = None;
+    while let Some(mut command) = next.take().or_else(|| rx.recv().ok()) {
+        let batch_limit = if rx.is_empty() { 1 } else { MAX_OUTPUT_BATCH };
+        if !failed {
+            // Avoid copying or another queue receive for an isolated update.
+            terminal.writer_mut().buffered = batch_limit > 1;
+        }
+        let mut batch_bytes = 0;
+        for count in 1..=batch_limit {
+            let result = match command {
+                TerminalCommand::Finish(bytes) => {
+                    if !failed && let Err(error) = terminal.flush() {
+                        terminal.mark_write_failed();
+                        report_failure(anyhow::Error::new(error).context("write terminal output"));
+                    }
+                    return terminal.finish(&bytes).context("restore terminal modes");
+                }
+                _ if failed => break,
+                TerminalCommand::Output { bytes, extra } => {
+                    batch_bytes += bytes.len() + extra.len();
+                    let result = terminal
+                        .write_child(&bytes, &extra)
+                        .context("write terminal output");
+                    let _ = recycle.try_send(bytes);
+                    result
+                }
+                TerminalCommand::Controls(bytes) => {
+                    batch_bytes += bytes.len();
+                    terminal
+                        .write_extra(&bytes)
+                        .context("write terminal controls")
+                }
+            };
+            if let Err(error) = result {
+                failed = true;
+                terminal.mark_write_failed();
+                report_failure(error);
+                break;
             }
-            _ if failed => continue,
-            TerminalCommand::Output { bytes, extra } => {
-                let result = terminal
-                    .write_child(&bytes, &extra)
-                    .context("write terminal output");
-                let _ = recycle.try_send(bytes);
-                result
+            if count == batch_limit || batch_bytes >= CHUNK_SIZE {
+                break;
             }
-            TerminalCommand::Controls(bytes) => terminal
-                .write_extra(&bytes)
-                .context("write terminal controls"),
-        };
-        if let Err(error) = result {
+            next = rx.try_recv().ok();
+            if next
+                .as_ref()
+                .is_none_or(|command| command.byte_len() > CHUNK_SIZE - batch_bytes)
+            {
+                break;
+            }
+            command = next.take().unwrap();
+        }
+        if !failed && let Err(error) = terminal.flush() {
             failed = true;
-            // Abort the child promptly, but keep ownership until the coordinator
-            // supplies cleanup.  Even a failed stream gets a restoration attempt.
-            report_failure(error);
+            terminal.mark_write_failed();
+            // Abort promptly, then drain commands until cleanup arrives.
+            report_failure(anyhow::Error::new(error).context("write terminal output"));
         }
     }
     Err(anyhow::anyhow!("terminal writer closed without cleanup"))
+}
+
+/// A failed flush discards the unwritten suffix, so cleanup cannot replay it.
+/// Unlike BufWriter, dropping this buffer never retries a failed write.
+struct OutputBuffer<W> {
+    writer: W,
+    bytes: Vec<u8>,
+    buffered: bool,
+}
+
+impl<W: Write> OutputBuffer<W> {
+    fn new(writer: W) -> Self {
+        Self {
+            writer,
+            bytes: Vec::new(),
+            buffered: false,
+        }
+    }
+}
+
+impl<W: Write> Write for OutputBuffer<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if !self.buffered {
+            return self.writer.write(bytes);
+        }
+        if bytes.len() > CHUNK_SIZE - self.bytes.len() {
+            self.flush()?;
+        }
+        if bytes.len() >= CHUNK_SIZE {
+            return self.writer.write(bytes);
+        }
+        if self.bytes.capacity() == 0 {
+            self.bytes.reserve_exact(CHUNK_SIZE);
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let result = self.writer.write_all(&self.bytes);
+        self.bytes.clear();
+        result?;
+        self.writer.flush()
+    }
 }
 
 fn write_input(mut writer: impl Write, rx: Receiver<InputCommand>) -> Result<()> {
@@ -1012,6 +1100,173 @@ mod tests {
         let mut bytes = Vec::new();
         write_terminal(&mut bytes, true, rx, recycle, |_| unreachable!()).unwrap();
         assert_eq!(bytes, b"\x1b[31mX\x1b[?25l\x1b[?25h");
+    }
+
+    #[derive(Default)]
+    struct RecordingWriter(Vec<Vec<u8>>);
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if !bytes.is_empty() {
+                self.0.push(bytes.to_vec());
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn queued_output_is_batched_with_a_message_limit() {
+        let (tx, rx) = bounded(32);
+        for _ in 0..17 {
+            tx.send(TerminalCommand::Output {
+                bytes: vec![b'x'],
+                extra: vec![],
+            })
+            .unwrap();
+        }
+        tx.send(TerminalCommand::Finish(CURSOR_SHOW.to_vec()))
+            .unwrap();
+        let (recycle, _) = bounded(1);
+        let mut writer = RecordingWriter::default();
+        write_terminal(&mut writer, true, rx, recycle, |_| unreachable!()).unwrap();
+        assert_eq!(
+            writer.0,
+            [
+                vec![b'x'; 8],
+                vec![b'x'; 8],
+                vec![b'x'],
+                CURSOR_SHOW.to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn queued_output_is_flushed_at_the_byte_limit() {
+        let (tx, rx) = bounded(16);
+        for byte in 0..8 {
+            tx.send(TerminalCommand::Output {
+                bytes: vec![byte; 20_000],
+                extra: vec![],
+            })
+            .unwrap();
+        }
+        tx.send(TerminalCommand::Finish(CURSOR_SHOW.to_vec()))
+            .unwrap();
+        let (recycle, _) = bounded(1);
+        let mut writer = RecordingWriter::default();
+        write_terminal(&mut writer, true, rx, recycle, |_| unreachable!()).unwrap();
+        assert_eq!(
+            writer.0.iter().map(Vec::len).collect::<Vec<_>>(),
+            [60_000, 60_000, 40_000, CURSOR_SHOW.len()]
+        );
+        let expected: Vec<_> = (0..8)
+            .flat_map(|byte| vec![byte; 20_000])
+            .chain(CURSOR_SHOW.iter().copied())
+            .collect();
+        assert_eq!(writer.0.concat(), expected);
+    }
+
+    #[test]
+    fn isolated_output_is_flushed_before_waiting_for_another_command() {
+        struct FlushNotice(Sender<Vec<u8>>, Vec<u8>);
+        impl Write for FlushNotice {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.1.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0.send(std::mem::take(&mut self.1)).unwrap();
+                Ok(())
+            }
+        }
+        let (tx, rx) = bounded(8);
+        let (flushed, notices) = bounded(8);
+        let (recycle, _) = bounded(1);
+        let worker = thread::spawn(move || {
+            write_terminal(
+                FlushNotice(flushed, vec![]),
+                true,
+                rx,
+                recycle,
+                |_| unreachable!(),
+            )
+        });
+        tx.send(TerminalCommand::Output {
+            bytes: vec![b'x'],
+            extra: vec![],
+        })
+        .unwrap();
+        assert_eq!(notices.recv_timeout(TIMEOUT).unwrap(), b"x");
+        tx.send(TerminalCommand::Finish(vec![])).unwrap();
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn output_buffer_never_exceeds_one_chunk_or_flushes_on_drop() {
+        let mut writer = RecordingWriter::default();
+        {
+            let mut output = OutputBuffer::new(&mut writer);
+            output.buffered = true;
+            let chunk = vec![b'x'; CHUNK_SIZE / 2 + 1];
+            output.write_all(&chunk).unwrap();
+            output.write_all(&chunk).unwrap();
+            assert_eq!(output.bytes.capacity(), CHUNK_SIZE);
+            // The second half remains buffered and must not be retried on drop.
+        }
+        assert_eq!(writer.0, [vec![b'x'; CHUNK_SIZE / 2 + 1]]);
+    }
+
+    #[test]
+    fn partial_batch_failure_discards_suffix_and_recovers_unknown_boundary() {
+        struct FailAfterEscape {
+            calls: usize,
+            bytes: Vec<u8>,
+        }
+        impl Write for FailAfterEscape {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                match self.calls {
+                    1 => {
+                        self.bytes.push(bytes[0]);
+                        Ok(1)
+                    }
+                    2 => Err(io::Error::other("partial write failed")),
+                    _ => {
+                        self.bytes.extend_from_slice(bytes);
+                        Ok(bytes.len())
+                    }
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (tx, rx) = bounded(8);
+        tx.send(TerminalCommand::Output {
+            bytes: b"\x1b[31mtext".to_vec(),
+            extra: vec![],
+        })
+        .unwrap();
+        tx.send(TerminalCommand::Controls(b"\x1b[?25l".to_vec()))
+            .unwrap();
+        tx.send(TerminalCommand::Finish(CURSOR_SHOW.to_vec()))
+            .unwrap();
+        let (recycle, _) = bounded(1);
+        let mut writer = FailAfterEscape {
+            calls: 0,
+            bytes: vec![],
+        };
+        let mut errors = Vec::new();
+        write_terminal(&mut writer, true, rx, recycle, |error| {
+            errors.push(error.to_string())
+        })
+        .unwrap();
+        assert_eq!(errors, ["write terminal output"]);
+        assert_eq!(writer.bytes, b"\x1b\x18\x1b\\\x18\x1b[?25h");
     }
 
     struct FailedIo;
