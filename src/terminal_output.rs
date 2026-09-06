@@ -1,6 +1,10 @@
 use std::io::{self, Write};
 use vtparse::{CsiParam, VTActor, VTParser};
 
+// Normally only a few updates await the next sequence boundary.  Allow dozens
+// of current 14-25 byte controls, then fail rather than accumulate indefinitely.
+const MAX_PENDING_CONTROLS: usize = 1024;
+
 /// Writes child output and synthetic controls in stream order.  Controls must
 /// wait for a complete escape sequence or UTF-8 character.
 pub(crate) struct TerminalOutput<W> {
@@ -39,10 +43,24 @@ impl<W: Write> TerminalOutput<W> {
         if self.finished {
             return Ok(());
         }
-        self.pending.extend_from_slice(bytes);
         if self.parser.as_ref().is_none_or(SequenceTracker::is_ground) {
             self.writer.write_all(&self.pending)?;
             self.pending.clear();
+            self.writer.write_all(bytes)?;
+        } else {
+            if bytes.len() > MAX_PENDING_CONTROLS - self.pending.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pending terminal controls exceed 1 KiB",
+                ));
+            }
+            let needed = self.pending.len() + bytes.len();
+            if needed > self.pending.capacity() {
+                // Keep geometric growth without allocating beyond the cap.
+                self.pending
+                    .reserve_exact(needed.next_power_of_two() - self.pending.len());
+            }
+            self.pending.extend_from_slice(bytes);
         }
         self.writer.flush()
     }
@@ -153,6 +171,31 @@ mod tests {
     use super::*;
     use tfil::codex_mouse_ui::{CodexMouseUi, MOUSE_ENABLE, POINTER_ON};
     use tfil::filters::tmux_wrap;
+
+    #[test]
+    fn pending_controls_are_capped_and_cleanup_remains_possible() {
+        let mut output = TerminalOutput::new(Vec::new(), true);
+        output.write_child(b"\x1b]0;unfinished", &[]).unwrap();
+        let controls = b"\x1b[m".repeat(MAX_PENDING_CONTROLS / 3);
+        output.write_extra(&controls).unwrap();
+        let before = output.pending.len();
+        let error = output.write_extra(b"\x1b[m").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(output.pending.len(), before);
+        assert!(output.pending.capacity() <= MAX_PENDING_CONTROLS);
+        output.finish(b"\x1b[?25h").unwrap();
+        assert!(output.pending.is_empty());
+        assert_eq!(output.writer, b"\x1b]0;unfinished\x18\x1b\\\x18\x1b[?25h");
+    }
+
+    #[test]
+    fn complete_sequences_do_not_accumulate_controls() {
+        let mut output = TerminalOutput::new(Vec::new(), true);
+        let controls = b"\x1b[m".repeat(MAX_PENDING_CONTROLS);
+        output.write_extra(&controls).unwrap();
+        assert_eq!(output.writer, controls);
+        assert_eq!(output.pending.capacity(), 0);
+    }
 
     #[test]
     fn mouse_reassertion_does_not_leak_synchronized_update_suffix() {
