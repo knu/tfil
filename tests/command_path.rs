@@ -27,20 +27,24 @@ fn commands_resolve_relative_paths_and_path_names() {
         } else {
             tmp.path()
         };
-        let output = Command::new(env!("CARGO_BIN_EXE_tfil"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_tfil"))
             .args(["--", program, "hello world"])
             .current_dir(cwd)
             .env("PATH", &bin_dir)
-            .stdin(Stdio::null())
-            .output()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
+        // Keep PTY EOF echo out of the command's output.
+        let _input = child.stdin.take();
+        let output = child.wait_with_output().unwrap();
         assert_eq!(
             output.status.code(),
             Some(42),
             "{program}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        // The PTY may echo control characters when tfil forwards stdin EOF.
-        assert!(output.stdout.ends_with(b"target: hello world"), "{program}");
+        assert_eq!(output.stdout, b"target: hello world", "{program}");
     }
 }
