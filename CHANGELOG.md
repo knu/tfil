@@ -8,6 +8,21 @@ version bumps for fixes.  Once `1.0.0` ships, the project will revisit and
 likely adopt strict [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.2.6] - 2026-09-06
+
+### Changed
+
+- Streamline Ink fake cursor recognition
+- Serialize session state through bounded queues
+- Bypass coordination for streams without mouse UI
+- Batch queued terminal output in bounded writes
+
+### Fixed
+
+- Protect terminal controls through shutdown
+- fix: Preserve worker errors across queue disconnects
+- fix: Cap deferred terminal controls at 1 KiB
+
 ## [0.2.5] - 2026-09-06
 
 ### Fixed
