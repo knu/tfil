@@ -267,7 +267,15 @@ impl Coordinator {
         let mut stop = Some(stop);
         let mut child_closed = false;
         let mut resize_closed = false;
+        let mut disconnected = 0u8;
+        let mut completed_workers = 0u8;
+        let mut terminal_result = None;
         loop {
+            if disconnected & !completed_workers == 0
+                && let Some(result) = terminal_result.take()
+            {
+                return self.error.map_or(result, Err);
+            }
             if self.pending_terminal.is_none() {
                 self.pending_terminal = self.pending_controls.take().map(TerminalCommand::Controls);
             }
@@ -286,15 +294,16 @@ impl Coordinator {
 
             let mut select = Select::new();
             let completed = select.recv(&ports.completed);
-            let output = (!self.output_eof && self.pending_terminal.is_none())
-                .then(|| select.recv(&ports.output));
+            let output = (!self.output_eof
+                && disconnected & (1 << Worker::OutputReader as u8) == 0
+                && self.pending_terminal.is_none())
+            .then(|| select.recv(&ports.output));
             let input = (!self.input_eof
                 && self.pending_controls.is_none()
                 && self.pending_child.is_none())
             .then(|| select.recv(&ports.input));
-            let terminal = self
-                .pending_terminal
-                .is_some()
+            let terminal = (self.pending_terminal.is_some()
+                && disconnected & (1 << Worker::TerminalWriter as u8) == 0)
                 .then(|| select.send(&ports.terminal));
             let child = self
                 .pending_child
@@ -307,12 +316,16 @@ impl Coordinator {
                 let Completion { worker, result } = operation
                     .recv(&ports.completed)
                     .context("worker notifications disconnected")?;
+                completed_workers |= 1 << worker as u8;
                 if worker == Worker::TerminalWriter {
-                    if let Err(error) = result {
+                    if result.is_err() {
                         abort();
-                        return Err(self.error.unwrap_or(error));
                     }
-                    return self.error.map_or(Ok(()), Err);
+                    terminal_result = Some(result);
+                    continue;
+                }
+                if worker == Worker::OutputReader && disconnected & (1 << worker as u8) != 0 {
+                    self.output_eof = true;
                 }
                 if worker == Worker::ChildWriter {
                     child_closed = true;
@@ -330,24 +343,38 @@ impl Coordinator {
                 }
                 result
             } else if Some(index) == output {
-                operation
-                    .recv(&ports.output)
-                    .map(|event| self.on_output(event))
-                    .context("PTY output queue disconnected")
+                match operation.recv(&ports.output) {
+                    Ok(event) => self.on_output(event),
+                    Err(_) => {
+                        disconnected |= 1 << Worker::OutputReader as u8;
+                        self.output_eof =
+                            completed_workers & (1 << Worker::OutputReader as u8) != 0;
+                    }
+                }
+                Ok(())
             } else if Some(index) == input {
-                operation
-                    .recv(&ports.input)
-                    .map(|event| self.on_input(event))
-                    .context("input queue disconnected")
+                match operation.recv(&ports.input) {
+                    Ok(event) => self.on_input(event),
+                    Err(_) => {
+                        disconnected |= 1 << Worker::InputReader as u8;
+                        self.input_eof = true;
+                    }
+                }
+                Ok(())
             } else if Some(index) == terminal {
-                operation
+                if operation
                     .send(&ports.terminal, self.pending_terminal.take().unwrap())
-                    .map_err(|_| anyhow::anyhow!("terminal writer disconnected"))
+                    .is_err()
+                {
+                    disconnected |= 1 << Worker::TerminalWriter as u8;
+                }
+                Ok(())
             } else if Some(index) == child {
                 if operation
                     .send(&ports.child, self.pending_child.take().unwrap())
                     .is_err()
                 {
+                    disconnected |= 1 << Worker::ChildWriter as u8;
                     child_closed = true;
                     self.input_eof = true;
                 }
@@ -590,6 +617,64 @@ mod tests {
             self.complete(Worker::TerminalWriter, Ok(()));
             self.result.recv_timeout(TIMEOUT).unwrap().unwrap();
         }
+    }
+
+    #[test]
+    fn disconnect_never_masks_reader_error() {
+        for notice_first in [false, true] {
+            for worker in [Worker::OutputReader, Worker::InputReader] {
+                let mut h = Harness::start(Coordinator::new(None, true, false));
+                if notice_first {
+                    h.complete(worker, Err(anyhow::anyhow!("original read failure")));
+                }
+                let (replacement, _) = bounded(1);
+                drop(std::mem::replace(
+                    if worker == Worker::OutputReader {
+                        &mut h.output
+                    } else {
+                        &mut h.input
+                    },
+                    replacement,
+                ));
+                if !notice_first {
+                    h.complete(worker, Err(anyhow::anyhow!("original read failure")));
+                }
+                assert!(matches!(
+                    h.terminal.recv_timeout(TIMEOUT).unwrap(),
+                    TerminalCommand::Finish(_)
+                ));
+                h.complete(Worker::TerminalWriter, Ok(()));
+                assert_eq!(
+                    h.result
+                        .recv_timeout(TIMEOUT)
+                        .unwrap()
+                        .unwrap_err()
+                        .to_string(),
+                    "original read failure"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disconnected_terminal_preserves_worker_panic() {
+        let mut coordinator = Coordinator::new(None, false, false);
+        coordinator.on_output(ReadEvent::Data(vec![1]));
+        let mut h = Harness::start(coordinator);
+        let (_, replacement) = bounded(1);
+        drop(std::mem::replace(&mut h.terminal, replacement));
+        h.complete(
+            Worker::TerminalWriter,
+            Err(anyhow::anyhow!("TerminalWriter panicked")),
+        );
+        assert_eq!(
+            h.result
+                .recv_timeout(TIMEOUT)
+                .unwrap()
+                .unwrap_err()
+                .to_string(),
+            "TerminalWriter panicked"
+        );
     }
 
     #[test]
