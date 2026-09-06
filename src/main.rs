@@ -188,6 +188,15 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
         .openpty(current_pty_size())
         .context("openpty failed")?;
 
+    // portable-pty otherwise searches PATH for relative paths like "bin/cmd".
+    let program = if program.is_relative() && program.as_os_str().as_encoded_bytes().contains(&b'/')
+    {
+        std::env::current_dir()
+            .context("get current directory")?
+            .join(program)
+    } else {
+        program
+    };
     let mut cmd = CommandBuilder::new(&program);
     for arg in &args {
         cmd.arg(arg);
