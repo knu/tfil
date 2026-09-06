@@ -1,8 +1,8 @@
 use std::io::{self, Write};
 use vtparse::{CsiParam, VTActor, VTParser};
 
-/// Serializes child output and synthetic terminal controls across input/output
-/// threads.  Controls must wait for a complete escape sequence or UTF-8 character.
+/// Writes child output and synthetic controls in stream order.  Controls must
+/// wait for a complete escape sequence or UTF-8 character.
 pub(crate) struct TerminalOutput<W> {
     writer: W,
     parser: Option<SequenceTracker>,
@@ -47,8 +47,8 @@ impl<W: Write> TerminalOutput<W> {
         self.writer.flush()
     }
 
-    /// Ends the child stream and restores terminal modes.  Late input-thread
-    /// updates and queued controls must not re-enable modes after cleanup.
+    /// Ends the child stream and restores terminal modes.  Queued controls must
+    /// not re-enable modes after cleanup.
     pub(crate) fn finish(&mut self, controls: &[u8]) -> io::Result<()> {
         if self.finished {
             return Ok(());

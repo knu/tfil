@@ -28,6 +28,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
 libc = "0.2"
 memchr = "2"
 portable-pty = "0.9"

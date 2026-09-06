@@ -1,29 +1,22 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
-use signal_hook::consts::SIGWINCH;
-use signal_hook::iterator::Signals;
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::ffi::OsString;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use tfil::codex_mouse_ui::{CodexMouseUi, MOUSE_DISABLE, POINTER_OFF};
+use tfil::codex_mouse_ui::CodexMouseUi;
 use tfil::filters::{
     CursorShapeFilter, Filter, FilterChain, InkFakeCursorFilter, OscTitleFilter,
-    TmuxOscPassthroughFilter, tmux_wrap,
+    TmuxOscPassthroughFilter,
 };
 
+mod session;
 mod terminal_output;
 mod wrapper;
 
-use terminal_output::TerminalOutput;
-
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")");
-const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -211,10 +204,6 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
     let mut child = pair.slave.spawn_command(cmd).context("spawn failed")?;
     drop(pair.slave);
 
-    let mut reader = pair.master.try_clone_reader().context("clone reader")?;
-    let mut writer = pair.master.take_writer().context("take writer")?;
-    let master = Arc::new(Mutex::new(pair.master));
-
     let mut filters: Vec<Box<dyn Filter + Send>> = Vec::new();
     if cli.strip_ink_fake_cursor {
         filters.push(Box::new(InkFakeCursorFilter::new()));
@@ -237,178 +226,23 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
         let size = current_pty_size();
         let mut m = CodexMouseUi::new(size.rows, size.cols);
         m.set_tmux_pointer(tmux_pointer);
-        Arc::new(Mutex::new(m))
+        m
     });
 
-    let terminal = Arc::new(Mutex::new(TerminalOutput::new(
-        io::stdout(),
-        mouse.is_some() || cli.strip_ink_fake_cursor,
-    )));
-
-    // Always put our stdin in raw mode: line editing is the slave PTY's
-    // job (its termios is cooked by default), so the parent must forward
-    // every byte without local cooking.
+    // Line editing belongs to the slave PTY; forward every input byte unchanged.
     let _raw_guard = RawModeGuard::enter()?;
-    let done = Arc::new(AtomicBool::new(false));
-
-    // child -> filter -> stdout
     let debug_dump = debug_dump_path(cli.debug_dump.as_deref());
-    let stdout_thread = {
-        let dump = debug_dump.as_deref().and_then(open_dump_file);
-        let mouse = mouse.clone();
-        let terminal = terminal.clone();
-        thread::spawn(move || -> Result<()> {
-            let mut filters = filters;
-            forward_output(&mut reader, &mut filters, dump, |out| {
-                let extra = mouse
-                    .as_ref()
-                    .map(|m| m.lock().unwrap().on_output(out))
-                    .unwrap_or_default();
-                terminal.lock().unwrap().write_child(out, &extra)?;
-                Ok(())
-            })
-        })
-    };
-
-    // stdin -> child
-    let stdin_done = done.clone();
-    let stdin_mouse = mouse.clone();
-    let stdin_terminal = terminal.clone();
-    thread::spawn(move || {
-        let mut buf = [0u8; 65536];
-        let stdin = io::stdin();
-        while !stdin_done.load(Ordering::SeqCst) {
-            let mut lock = stdin.lock();
-            match lock.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let to_child;
-                    let data: &[u8] = if let Some(m) = &stdin_mouse {
-                        let (child_bytes, term_bytes) = m.lock().unwrap().on_input(&buf[..n]);
-                        if !term_bytes.is_empty() {
-                            let _ = stdin_terminal.lock().unwrap().write_extra(&term_bytes);
-                        }
-                        to_child = child_bytes;
-                        &to_child
-                    } else {
-                        &buf[..n]
-                    };
-                    if !data.is_empty() {
-                        if writer.write_all(data).is_err() {
-                            break;
-                        }
-                        let _ = writer.flush();
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-        if let Some(m) = &stdin_mouse {
-            let tail = m.lock().unwrap().finish_input();
-            if !tail.is_empty() && writer.write_all(&tail).is_ok() {
-                let _ = writer.flush();
-            }
-        }
-    });
-
-    // SIGWINCH -> resize pty
-    let winch_master = master.clone();
-    let winch_done = done.clone();
-    let winch_mouse = mouse.clone();
-    thread::spawn(move || {
-        let Ok(mut signals) = Signals::new([SIGWINCH]) else {
-            return;
-        };
-        for _ in &mut signals {
-            if winch_done.load(Ordering::SeqCst) {
-                break;
-            }
-            let size = current_pty_size();
-            if let Ok(m) = winch_master.lock() {
-                let _ = m.resize(size);
-            }
-            if let Some(m) = &winch_mouse {
-                m.lock().unwrap().resize(size.rows, size.cols);
-            }
-        }
-    });
-
-    // Observe output failures before waiting: a child blocked writing to its
-    // PTY cannot exit if the forwarding thread has already failed.
-    let output_result = stdout_thread
-        .join()
-        .map_err(|_| anyhow::anyhow!("output thread panicked"))
-        .and_then(|result| result);
-    done.store(true, Ordering::SeqCst);
-    if output_result.is_err() {
-        let _ = child.kill();
-    }
-    let status = child.wait().context("wait failed");
-
-    let mouse_active = mouse
-        .as_ref()
-        .is_some_and(|mouse| mouse.lock().unwrap_or_else(|e| e.into_inner()).is_active());
-    let mut cleanup = Vec::new();
-    if mouse_active {
-        cleanup.extend_from_slice(MOUSE_DISABLE);
-        if tmux_pointer {
-            cleanup.extend_from_slice(&tmux_wrap(POINTER_OFF));
-        } else {
-            cleanup.extend_from_slice(POINTER_OFF);
-        }
-    }
-    if cli.strip_ink_fake_cursor {
-        cleanup.extend_from_slice(CURSOR_SHOW);
-    }
-    finish_session(
-        &mut terminal.lock().unwrap_or_else(|e| e.into_inner()),
-        &cleanup,
-        output_result,
-        status,
+    session::run(
+        child.as_mut(),
+        pair.master,
+        filters,
+        mouse,
+        session::Options {
+            restore_cursor: cli.strip_ink_fake_cursor,
+            tmux_pointer,
+            dump: debug_dump.as_deref().and_then(open_dump_file),
+        },
     )
-}
-
-fn forward_output(
-    reader: &mut dyn Read,
-    filters: &mut FilterChain,
-    mut dump: Option<std::fs::File>,
-    mut emit: impl FnMut(&[u8]) -> Result<()>,
-) -> Result<()> {
-    let mut buf = [0u8; 65536];
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if let Some(file) = dump.as_mut() {
-                    let _ = file.write_all(&buf[..n]);
-                    let _ = file.flush();
-                }
-                emit(&filters.filter(&buf[..n])).context("write terminal output")?;
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            // portable-pty converts the slave's closing EIO to EOF.
-            Err(e) => return Err(e).context("read PTY output"),
-        }
-    }
-    let pending = filters.finish();
-    if !pending.is_empty() {
-        emit(&pending).context("write terminal output")?;
-    }
-    Ok(())
-}
-
-fn finish_session<W: Write>(
-    terminal: &mut TerminalOutput<W>,
-    cleanup: &[u8],
-    output_result: Result<()>,
-    status: Result<ExitStatus>,
-) -> Result<i32> {
-    let restored = terminal.finish(cleanup).context("restore terminal modes");
-    output_result?;
-    let status = status?;
-    restored?;
-    Ok(status.exit_code() as i32)
 }
 
 fn current_pty_size() -> PtySize {
@@ -498,110 +332,6 @@ impl Drop for RawModeGuard {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-
-    #[test]
-    fn eof_output_updates_the_mouse_model() {
-        let mut filters = FilterChain::new(vec![Box::new(InkFakeCursorFilter::new())]);
-        let input = b"\x1b[7m \x1b[?2004h";
-        let mut mouse = CodexMouseUi::new(24, 80);
-        let mut output = Vec::new();
-        forward_output(&mut input.as_slice(), &mut filters, None, |bytes| {
-            mouse.on_output(bytes);
-            output.extend_from_slice(bytes);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(output, input);
-        assert!(mouse.is_active());
-    }
-
-    struct FailedReader;
-    impl Read for FailedReader {
-        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-            Err(io::Error::other("read failure"))
-        }
-    }
-
-    #[test]
-    fn forwarding_reports_read_and_write_failures() {
-        let read_error = forward_output(
-            &mut FailedReader,
-            &mut FilterChain::default(),
-            None,
-            |_| unreachable!(),
-        )
-        .unwrap_err();
-        assert_eq!(read_error.to_string(), "read PTY output");
-
-        let write_error = forward_output(
-            &mut b"output".as_slice(),
-            &mut FilterChain::default(),
-            None,
-            |_| Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed").into()),
-        )
-        .unwrap_err();
-        assert_eq!(write_error.to_string(), "write terminal output");
-    }
-
-    #[test]
-    fn session_restores_modes_before_returning_errors() {
-        for fail_output in [false, true] {
-            let mut bytes = Vec::new();
-            let mut terminal = TerminalOutput::new(&mut bytes, true);
-            terminal.write_child(b"\x1b[?20", &[]).unwrap();
-            let output = if fail_output {
-                Err(anyhow::anyhow!("output failure"))
-            } else {
-                Ok(())
-            };
-            let error = finish_session(
-                &mut terminal,
-                CURSOR_SHOW,
-                output,
-                Err(anyhow::anyhow!("wait failure")),
-            )
-            .unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                if fail_output {
-                    "output failure"
-                } else {
-                    "wait failure"
-                }
-            );
-            assert_eq!(bytes, b"\x1b[?20\x18\x1b\\\x18\x1b[?25h");
-        }
-    }
-
-    struct FailedWriter;
-    impl Write for FailedWriter {
-        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-            Err(io::Error::other("write failure"))
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn session_reports_cleanup_failure_and_preserves_child_exit_code() {
-        let error = finish_session(
-            &mut TerminalOutput::new(FailedWriter, true),
-            CURSOR_SHOW,
-            Ok(()),
-            Ok(ExitStatus::with_exit_code(0)),
-        )
-        .unwrap_err();
-        assert_eq!(error.to_string(), "restore terminal modes");
-        let code = finish_session(
-            &mut TerminalOutput::new(io::sink(), true),
-            CURSOR_SHOW,
-            Ok(()),
-            Ok(ExitStatus::with_exit_code(42)),
-        )
-        .unwrap();
-        assert_eq!(code, 42);
-    }
 
     #[test]
     fn debug_dump_path_uses_env_when_cli_is_absent() {
