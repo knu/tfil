@@ -147,7 +147,12 @@ impl CodexMouseUi {
         (to_child, to_term)
     }
 
-    /// Flushes any partially buffered input sequence (call on stdin EOF).
+    /// Reports whether an input sequence is waiting for more bytes.
+    pub fn has_pending_input(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Flushes any partially buffered input sequence on timeout or stdin EOF.
     pub fn finish_input(&mut self) -> Vec<u8> {
         self.state = InState::Normal;
         std::mem::take(&mut self.pending)

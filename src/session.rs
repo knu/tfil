@@ -13,12 +13,16 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::thread;
+use std::time::{Duration, Instant};
 use tfil::codex_mouse_ui::{CodexMouseUi, MOUSE_DISABLE, POINTER_OFF};
 use tfil::filters::{Filter, FilterChain, tmux_wrap};
 
 const CHUNK_SIZE: usize = 65536;
 const QUEUE_CAPACITY: usize = 8;
 const MAX_OUTPUT_BATCH: usize = 8;
+// Match fish's ESC delay to balance standalone Escape latency and split input.
+// https://fishshell.com/docs/current/language.html#fish-escape-delay-ms
+const INPUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(30);
 const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
 
 pub(crate) struct Options {
@@ -262,6 +266,7 @@ struct Coordinator {
     pending_terminal: Option<TerminalCommand>,
     pending_controls: Option<Vec<u8>>,
     pending_child: Option<InputCommand>,
+    input_deadline: Option<Instant>,
     output: OutputState,
     input: InputState,
     error: Option<anyhow::Error>,
@@ -276,6 +281,7 @@ impl Coordinator {
             pending_terminal: None,
             pending_controls: None,
             pending_child: None,
+            input_deadline: None,
             output: OutputState::Reading,
             input: InputState::Reading,
             error: None,
@@ -316,7 +322,11 @@ impl Coordinator {
         match event {
             ReadEvent::Data(bytes) => {
                 let (bytes, controls) = if let Some(mouse) = &mut self.mouse {
-                    mouse.on_input(&bytes)
+                    let result = mouse.on_input(&bytes);
+                    self.input_deadline = mouse
+                        .has_pending_input()
+                        .then(|| Instant::now() + INPUT_SEQUENCE_TIMEOUT);
+                    result
                 } else {
                     (bytes, Vec::new())
                 };
@@ -328,6 +338,7 @@ impl Coordinator {
                 }
             }
             ReadEvent::Eof => {
+                self.input_deadline = None;
                 self.input.close();
                 let tail = self
                     .mouse
@@ -338,6 +349,17 @@ impl Coordinator {
                     self.pending_child = Some(InputCommand::Data(tail));
                 }
             }
+        }
+    }
+
+    fn expire_input(&mut self, now: Instant) {
+        if self.input == InputState::Reading
+            && self.pending_child.is_none()
+            && self.input_deadline.is_some_and(|deadline| now >= deadline)
+        {
+            self.input_deadline = None;
+            let bytes = self.mouse.as_mut().unwrap().finish_input();
+            self.pending_child = Some(InputCommand::Data(bytes));
         }
     }
 
@@ -413,6 +435,7 @@ impl Coordinator {
                 return self.error.map_or(result, Err);
             }
             self.prepare_commands(&mut stop);
+            self.expire_input(Instant::now());
 
             let mut select = Select::new();
             let completed = select.recv(&ports.completed);
@@ -433,7 +456,17 @@ impl Coordinator {
                 .then(|| select.send(&ports.child));
             let resized = (!resize_closed && self.output == OutputState::Reading)
                 .then(|| select.recv(&ports.resize));
-            let operation = select.select();
+            let operation = if self.input == InputState::Reading
+                && self.pending_child.is_none()
+                && let Some(deadline) = self.input_deadline
+            {
+                match select.select_deadline(deadline) {
+                    Ok(operation) => operation,
+                    Err(_) => continue,
+                }
+            } else {
+                select.select()
+            };
             let index = operation.index();
             let outcome = if index == completed {
                 let notice = operation
@@ -741,7 +774,6 @@ fn write_input(mut writer: impl Write, rx: Receiver<InputCommand>) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use tfil::filters::InkFakeCursorFilter;
 
     const TIMEOUT: Duration = Duration::from_secs(5);
@@ -964,6 +996,74 @@ mod tests {
             "failed reader"
         );
         assert_eq!(bytes, b"\x1b[?200\x18\x1b\\\x18\x1b[?25h");
+    }
+
+    #[test]
+    fn lone_escape_is_forwarded_without_waiting_for_next_key() {
+        let mut mouse = CodexMouseUi::new(24, 80);
+        mouse.on_output(b"\x1b[?2004h");
+        let h = Harness::start(Coordinator::new(Some(mouse), false, false));
+        h.input.send(ReadEvent::Data(b"\x1b".to_vec())).unwrap();
+        assert!(
+            matches!(h.child.recv_timeout(TIMEOUT).unwrap(), InputCommand::Data(bytes) if bytes == b"\x1b")
+        );
+        h.input.send(ReadEvent::Data(b"a".to_vec())).unwrap();
+        assert!(
+            matches!(h.child.recv_timeout(TIMEOUT).unwrap(), InputCommand::Data(bytes) if bytes == b"a")
+        );
+        h.finish();
+    }
+
+    #[test]
+    fn input_timeout_preserves_pending_child_and_resets_parser() {
+        for prefix in [b"\x1b".as_slice(), b"\x1b[", b"\x1b[<0;1;"] {
+            let mut mouse = CodexMouseUi::new(24, 80);
+            mouse.on_output(b"\x1b[?2004h");
+            let mut c = Coordinator::new(Some(mouse), false, false);
+            c.on_input(ReadEvent::Data([b"a", prefix].concat()));
+            let deadline = c.input_deadline.unwrap();
+            c.expire_input(deadline);
+            assert!(
+                matches!(c.pending_child.take(), Some(InputCommand::Data(bytes)) if bytes == b"a")
+            );
+            c.expire_input(deadline - Duration::from_millis(1));
+            assert!(c.pending_child.is_none());
+            c.expire_input(deadline);
+            assert!(
+                matches!(c.pending_child.take(), Some(InputCommand::Data(bytes)) if bytes == prefix)
+            );
+            assert!(c.input_deadline.is_none());
+            c.on_input(ReadEvent::Data(b"hello".to_vec()));
+            assert!(
+                matches!(c.pending_child.take(), Some(InputCommand::Data(bytes)) if bytes == b"hello")
+            );
+        }
+    }
+
+    #[test]
+    fn input_sequences_completed_before_timeout_keep_their_meaning() {
+        for sequence in [b"\x1b[A".as_slice(), b"\x1ba", b"\x1b[<0;1;1M"] {
+            for split in 1..sequence.len() {
+                let mut mouse = CodexMouseUi::new(24, 80);
+                mouse.on_output(b"\x1b[?2004h");
+                let mut c = Coordinator::new(Some(mouse), false, false);
+                c.on_input(ReadEvent::Data(sequence[..split].to_vec()));
+                let deadline = c.input_deadline.unwrap();
+                c.expire_input(deadline - Duration::from_millis(1));
+                assert!(c.pending_child.is_none());
+                c.on_input(ReadEvent::Data(sequence[split..].to_vec()));
+                assert!(c.input_deadline.is_none());
+                if sequence.starts_with(b"\x1b[<") {
+                    assert!(c.pending_child.is_none());
+                } else {
+                    assert!(
+                        matches!(c.pending_child.take(), Some(InputCommand::Data(bytes)) if bytes == sequence)
+                    );
+                }
+                c.expire_input(deadline);
+                assert!(c.pending_child.is_none());
+            }
+        }
     }
 
     #[test]
