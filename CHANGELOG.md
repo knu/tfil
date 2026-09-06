@@ -8,6 +8,12 @@ version bumps for fixes.  Once `1.0.0` ships, the project will revisit and
 likely adopt strict [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.2.7] - 2026-09-06
+
+### Fixed
+
+- Fix Escape swallowing the next input character
+
 ## [0.2.6] - 2026-09-06
 
 ### Changed
