@@ -1,32 +1,12 @@
-use super::Filter;
-use memchr::memchr;
+use super::{Filter, osc::OscScanner};
 use std::borrow::Cow;
 
-/// Wraps selected OSC sequences in a tmux `DCS tmux; ... ST`
-/// passthrough so they reach the outer terminal instead of being
-/// swallowed by tmux.  Only OSCs whose numeric code is in the
-/// configured list are wrapped; everything else is passed through
-/// unchanged.  Requires `allow-passthrough on` in tmux (3.3+).
+/// Wraps selected OSCs in a tmux DCS passthrough.  Requires
+/// allow-passthrough on in tmux (3.3+).
 #[derive(Debug, Default)]
 pub struct TmuxOscPassthroughFilter {
     codes: Vec<u16>,
-    pending: Vec<u8>,
-    state: State,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum State {
-    #[default]
-    Normal,
-    SawEsc,
-    /// Inside an OSC; `wrap` is `None` while the numeric code is still
-    /// being read.
-    InOsc {
-        wrap: Option<bool>,
-    },
-    InOscEsc {
-        wrap: Option<bool>,
-    },
+    scanner: OscScanner,
 }
 
 impl TmuxOscPassthroughFilter {
@@ -34,128 +14,44 @@ impl TmuxOscPassthroughFilter {
     pub fn new(codes: Vec<u16>) -> Self {
         Self {
             codes,
-            ..Self::default()
+            scanner: OscScanner::default(),
         }
-    }
-
-    fn decide(&self) -> bool {
-        parse_osc_code(&self.pending).is_some_and(|code| self.codes.contains(&code))
-    }
-
-    fn complete(&mut self, out: &mut Vec<u8>, wrap: bool) {
-        if wrap {
-            out.extend_from_slice(&tmux_wrap(&self.pending));
-        } else {
-            out.extend_from_slice(&self.pending);
-        }
-        self.pending.clear();
-        self.state = State::Normal;
     }
 }
 
 impl Filter for TmuxOscPassthroughFilter {
     fn filter<'a>(&mut self, data: &'a [u8]) -> Cow<'a, [u8]> {
-        if self.state == State::Normal && memchr(0x1B, data).is_none() {
-            return Cow::Borrowed(data);
-        }
-
-        let mut out = Vec::with_capacity(data.len());
-
-        for &byte in data {
-            match self.state {
-                State::Normal => {
-                    if byte == 0x1B {
-                        self.pending.clear();
-                        self.pending.push(byte);
-                        self.state = State::SawEsc;
-                    } else {
-                        out.push(byte);
-                    }
-                }
-                State::SawEsc => {
-                    self.pending.push(byte);
-                    if byte == b']' {
-                        self.state = State::InOsc { wrap: None };
-                    } else {
-                        out.extend_from_slice(&self.pending);
-                        self.pending.clear();
-                        self.state = State::Normal;
-                    }
-                }
-                State::InOsc { wrap } => {
-                    if byte == 0x07 {
-                        self.pending.push(byte);
-                        let wrap = wrap.unwrap_or_else(|| self.decide());
-                        self.complete(&mut out, wrap);
-                    } else if byte == 0x1B {
-                        let wrap = Some(wrap.unwrap_or_else(|| self.decide()));
-                        self.pending.push(byte);
-                        self.state = State::InOscEsc { wrap };
-                    } else if wrap.is_some() {
-                        self.pending.push(byte);
-                    } else if byte == b';' {
-                        let wrap = Some(self.decide());
-                        self.pending.push(byte);
-                        self.state = State::InOsc { wrap };
-                    } else if (0x20..=0x7E).contains(&byte) {
-                        self.pending.push(byte);
-                        if !byte.is_ascii_digit() {
-                            // Non-numeric OSC: never wrapped.
-                            self.state = State::InOsc { wrap: Some(false) };
-                        }
-                    } else {
-                        // Not a well-formed OSC: flush as-is and reset.
-                        self.pending.push(byte);
-                        out.extend_from_slice(&self.pending);
-                        self.pending.clear();
-                        self.state = State::Normal;
-                    }
-                }
-                State::InOscEsc { wrap } => {
-                    self.pending.push(byte);
-                    if byte == b'\\' {
-                        self.complete(&mut out, wrap.unwrap_or(false));
-                    } else {
-                        // Stray ESC inside OSC: treat as payload.
-                        self.state = State::InOsc { wrap };
-                    }
-                }
+        self.scanner.filter(data, |code, sequence, out| {
+            if code.is_some_and(|code| self.codes.contains(&code)) {
+                tmux_wrap_into(sequence, out);
+            } else {
+                out.extend_from_slice(sequence);
             }
-        }
-
-        Cow::Owned(out)
+        })
     }
 
     fn finish(&mut self) -> Vec<u8> {
-        self.state = State::Normal;
-        std::mem::take(&mut self.pending)
+        self.scanner.finish()
     }
-}
-
-/// Numeric code of a buffered OSC (`ESC ] <digits> ...`), if any.
-fn parse_osc_code(pending: &[u8]) -> Option<u16> {
-    let digits: Vec<u8> = pending
-        .get(2..)?
-        .iter()
-        .take_while(|b| b.is_ascii_digit())
-        .copied()
-        .collect();
-    std::str::from_utf8(&digits).ok()?.parse().ok()
 }
 
 /// Wraps a complete escape sequence in a tmux DCS passthrough,
 /// doubling every ESC in the payload as tmux requires.
 pub fn tmux_wrap(seq: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(seq.len() + 16);
+    tmux_wrap_into(seq, &mut out);
+    out
+}
+
+fn tmux_wrap_into(seq: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1bPtmux;");
     for &b in seq {
-        if b == 0x1B {
-            out.push(0x1B);
+        if b == 0x1b {
+            out.push(0x1b);
         }
         out.push(b);
     }
     out.extend_from_slice(b"\x1b\\");
-    out
 }
 
 #[cfg(test)]
@@ -164,6 +60,19 @@ mod tests {
 
     fn f22() -> TmuxOscPassthroughFilter {
         TmuxOscPassthroughFilter::new(vec![22])
+    }
+
+    #[test]
+    fn wraps_unicode_payload_without_changing_its_bytes() {
+        let input = "\x1b]22;日本語;pointer\x1b\\".as_bytes();
+        let expected = tmux_wrap(input);
+        for split in 0..=input.len() {
+            let mut filter = f22();
+            let mut output = filter.filter(&input[..split]).into_owned();
+            output.extend_from_slice(&filter.filter(&input[split..]));
+            output.extend(filter.finish());
+            assert_eq!(output, expected);
+        }
     }
 
     #[test]

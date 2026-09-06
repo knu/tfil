@@ -1,27 +1,10 @@
-use super::Filter;
-use memchr::memchr;
+use super::{Filter, osc::OscScanner};
 use std::borrow::Cow;
 
-/// Drops OSC 0/1/2 sequences (icon name and window title). Other OSCs
-/// (palette, hyperlinks, clipboard, ...) are passed through. Both ST
-/// (`ESC \`) and BEL terminators are recognized.
+/// Drops OSC 0/1/2 (icon name and window title); other OSCs retain their bytes.
 #[derive(Debug, Default)]
 pub struct OscTitleFilter {
-    pending: Vec<u8>,
-    state: State,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum State {
-    #[default]
-    Normal,
-    SawEsc,
-    InOsc {
-        drop: bool,
-    },
-    InOscEsc {
-        drop: bool,
-    },
+    scanner: OscScanner,
 }
 
 impl OscTitleFilter {
@@ -33,98 +16,37 @@ impl OscTitleFilter {
 
 impl Filter for OscTitleFilter {
     fn filter<'a>(&mut self, data: &'a [u8]) -> Cow<'a, [u8]> {
-        if self.state == State::Normal && memchr(0x1B, data).is_none() {
-            return Cow::Borrowed(data);
-        }
-
-        let mut out = Vec::with_capacity(data.len());
-
-        for &byte in data {
-            match self.state {
-                State::Normal => {
-                    if byte == 0x1B {
-                        self.pending.clear();
-                        self.pending.push(byte);
-                        self.state = State::SawEsc;
-                    } else {
-                        out.push(byte);
-                    }
-                }
-                State::SawEsc => {
-                    self.pending.push(byte);
-                    if byte == b']' {
-                        self.state = State::InOsc { drop: false };
-                    } else {
-                        out.extend_from_slice(&self.pending);
-                        self.pending.clear();
-                        self.state = State::Normal;
-                    }
-                }
-                State::InOsc { drop } => {
-                    let mut drop = drop;
-                    self.pending.push(byte);
-                    // Decide drop status as soon as we have read the parameter
-                    // and its terminating ';'. Until then, the buffer is
-                    // "ESC ] <digits>" with no decision yet.
-                    if byte == b';' {
-                        let param = &self.pending[2..self.pending.len() - 1];
-                        drop = matches!(param, b"0" | b"1" | b"2");
-                        self.state = State::InOsc { drop };
-                    } else if byte == 0x07 {
-                        if !drop {
-                            out.extend_from_slice(&self.pending);
-                        }
-                        self.pending.clear();
-                        self.state = State::Normal;
-                    } else if byte == 0x1B {
-                        self.state = State::InOscEsc { drop };
-                    } else if !is_osc_param_byte(byte) {
-                        // Unexpected byte before ';': not an OSC we recognize.
-                        // Flush as-is and reset.
-                        out.extend_from_slice(&self.pending);
-                        self.pending.clear();
-                        self.state = State::Normal;
-                    } else {
-                        self.state = State::InOsc { drop };
-                    }
-                }
-                State::InOscEsc { drop } => {
-                    self.pending.push(byte);
-                    if byte == b'\\' {
-                        if !drop {
-                            out.extend_from_slice(&self.pending);
-                        }
-                        self.pending.clear();
-                        self.state = State::Normal;
-                    } else {
-                        // Stray ESC inside OSC: stay in OSC, treat ESC as
-                        // part of the payload and continue.
-                        self.state = State::InOsc { drop };
-                    }
-                }
+        self.scanner.filter(data, |code, sequence, out| {
+            if !matches!(code, Some(0..=2)) {
+                out.extend_from_slice(sequence);
             }
-        }
-
-        Cow::Owned(out)
+        })
     }
 
     fn finish(&mut self) -> Vec<u8> {
-        let pending = std::mem::take(&mut self.pending);
-        self.state = State::Normal;
-        pending
+        self.scanner.finish()
     }
-}
-
-fn is_osc_param_byte(b: u8) -> bool {
-    // OSC parameters are typically digits, but we accept any printable
-    // ASCII before the first ';' so we don't accidentally swallow exotic
-    // OSCs. The decision to drop only fires when param is "0", "1", or "2".
-    (0x20..=0x7E).contains(&b)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_titles_with_semicolons_and_unicode_at_every_split() {
+        for code in ["0", "1", "2", "0002"] {
+            for terminator in ["\x07", "\x1b\\"] {
+                let input = format!("before\x1b]{code};hello;日本語{terminator}after");
+                for split in 0..=input.len() {
+                    let mut filter = OscTitleFilter::new();
+                    let mut output = filter.filter(&input.as_bytes()[..split]).into_owned();
+                    output.extend_from_slice(&filter.filter(&input.as_bytes()[split..]));
+                    output.extend(filter.finish());
+                    assert_eq!(output, b"beforeafter", "{code}, split {split}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn strips_osc0_title_with_bel() {

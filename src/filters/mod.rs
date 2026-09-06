@@ -9,6 +9,7 @@ use std::borrow::Cow;
 mod chain;
 mod cursor_shape;
 mod ink_fake_cursor;
+mod osc;
 mod osc_title;
 mod tmux_osc_passthrough;
 
