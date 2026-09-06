@@ -93,13 +93,25 @@ pub(crate) fn run(
     let (resize_tx, resize_rx) = bounded(1);
     let (recycle_tx, recycle_rx) = bounded(QUEUE_CAPACITY);
 
+    // Without a UI model, data needs no coordination.  EOF still goes through
+    // the coordinator, which appends closing commands to the same writer queues.
+    let direct_output = mouse.is_none().then(|| terminal_tx.clone());
     let cancel = stop_rx.clone();
     spawn_worker(Worker::OutputReader, completed_tx.clone(), move || {
-        read_output(reader, filters, options.dump, output_tx, cancel, recycle_rx)
+        read_output(
+            reader,
+            filters,
+            options.dump,
+            output_tx,
+            cancel,
+            recycle_rx,
+            direct_output,
+        )
     });
+    let direct_input = mouse.is_none().then(|| child_tx.clone());
     let cancel = stop_rx.clone();
     spawn_worker(Worker::InputReader, completed_tx.clone(), move || {
-        read_input(io::stdin(), input_tx, cancel)
+        read_input(io::stdin(), input_tx, cancel, direct_input)
     });
     let tracked = mouse.is_some() || options.restore_cursor;
     let failed = completed_tx.clone();
@@ -476,20 +488,34 @@ impl Coordinator {
     }
 }
 
-fn send_event(tx: &Sender<ReadEvent>, stop: &Receiver<()>, event: ReadEvent) -> bool {
+fn send_event<T>(tx: &Sender<T>, stop: &Receiver<()>, event: T) -> bool {
     select! {
         send(tx, event) -> result => result.is_ok(),
         recv(stop) -> _ => false,
     }
 }
 
-fn send_output(tx: &Sender<ReadEvent>, stop: &Receiver<()>, bytes: Vec<u8>) -> bool {
+fn send_output(
+    tx: &Sender<ReadEvent>,
+    stop: &Receiver<()>,
+    bytes: Vec<u8>,
+    direct: Option<&Sender<TerminalCommand>>,
+) -> bool {
+    let send = |bytes| {
+        if let Some(tx) = direct {
+            let command = TerminalCommand::Output {
+                bytes,
+                extra: Vec::new(),
+            };
+            send_event(tx, stop, command)
+        } else {
+            send_event(tx, stop, ReadEvent::Data(bytes))
+        }
+    };
     if bytes.len() <= CHUNK_SIZE {
-        bytes.is_empty() || send_event(tx, stop, ReadEvent::Data(bytes))
+        bytes.is_empty() || send(bytes)
     } else {
-        bytes
-            .chunks(CHUNK_SIZE)
-            .all(|chunk| send_event(tx, stop, ReadEvent::Data(chunk.to_vec())))
+        bytes.chunks(CHUNK_SIZE).all(|chunk| send(chunk.to_vec()))
     }
 }
 
@@ -500,6 +526,7 @@ fn read_output(
     tx: Sender<ReadEvent>,
     stop: Receiver<()>,
     recycled: Receiver<Vec<u8>>,
+    direct: Option<Sender<TerminalCommand>>,
 ) -> Result<()> {
     let mut buffer = Vec::new();
     loop {
@@ -524,7 +551,7 @@ fn read_output(
                     }
                     bytes => bytes.into_owned(),
                 };
-                if !send_output(&tx, &stop, bytes) {
+                if !send_output(&tx, &stop, bytes, direct.as_ref()) {
                     return Ok(());
                 }
             }
@@ -532,13 +559,18 @@ fn read_output(
             Err(error) => return Err(error).context("read PTY output"),
         }
     }
-    if send_output(&tx, &stop, filters.finish()) {
+    if send_output(&tx, &stop, filters.finish(), direct.as_ref()) {
         send_event(&tx, &stop, ReadEvent::Eof);
     }
     Ok(())
 }
 
-fn read_input(mut reader: impl Read, tx: Sender<ReadEvent>, stop: Receiver<()>) -> Result<()> {
+fn read_input(
+    mut reader: impl Read,
+    tx: Sender<ReadEvent>,
+    stop: Receiver<()>,
+    direct: Option<Sender<InputCommand>>,
+) -> Result<()> {
     let mut buffer = [0u8; 4096];
     loop {
         if stop.try_recv() != Err(TryRecvError::Empty) {
@@ -550,7 +582,13 @@ fn read_input(mut reader: impl Read, tx: Sender<ReadEvent>, stop: Receiver<()>) 
                 return Ok(());
             }
             Ok(n) => {
-                if !send_event(&tx, &stop, ReadEvent::Data(buffer[..n].to_vec())) {
+                let bytes = buffer[..n].to_vec();
+                let sent = if let Some(direct) = &direct {
+                    send_event(direct, &stop, InputCommand::Data(bytes))
+                } else {
+                    send_event(&tx, &stop, ReadEvent::Data(bytes))
+                };
+                if !sent {
                     return Ok(());
                 }
             }
@@ -877,6 +915,51 @@ mod tests {
     }
 
     #[test]
+    fn direct_output_flushes_filter_tail_before_eof_and_cleanup() {
+        let (events, rx) = bounded(1);
+        let (_stop, cancel) = bounded(0);
+        let (commands, output) = bounded(8);
+        let (recycle, recycled) = bounded(1);
+        let input = b"text\x1b[7m ";
+        read_output(
+            input.as_slice(),
+            FilterChain::new(vec![Box::new(InkFakeCursorFilter::new())]),
+            None,
+            events,
+            cancel,
+            recycled,
+            Some(commands.clone()),
+        )
+        .unwrap();
+        assert!(matches!(rx.recv().unwrap(), ReadEvent::Eof));
+        commands
+            .send(TerminalCommand::Finish(CURSOR_SHOW.to_vec()))
+            .unwrap();
+        let mut bytes = Vec::new();
+        write_terminal(&mut bytes, true, output, recycle, |_| unreachable!()).unwrap();
+        assert_eq!(bytes, [input.as_slice(), CURSOR_SHOW].concat());
+    }
+
+    #[test]
+    fn direct_input_precedes_coordinated_eof() {
+        let (events, rx) = bounded(1);
+        let (_stop, cancel) = bounded(0);
+        let (commands, input) = bounded(8);
+        read_input(
+            b"keyboard input".as_slice(),
+            events,
+            cancel,
+            Some(commands.clone()),
+        )
+        .unwrap();
+        assert!(matches!(rx.recv().unwrap(), ReadEvent::Eof));
+        commands.send(InputCommand::Eof).unwrap();
+        let mut bytes = Vec::new();
+        write_input(&mut bytes, input).unwrap();
+        assert_eq!(bytes, b"keyboard input");
+    }
+
+    #[test]
     fn filter_eof_updates_ui_before_finish() {
         let (tx, rx) = bounded(8);
         let (_stop, cancel) = bounded(0);
@@ -889,6 +972,7 @@ mod tests {
             tx,
             cancel,
             recycled,
+            None,
         )
         .unwrap();
         let mut coordinator = Coordinator::new(Some(CodexMouseUi::new(24, 80)), false, false);
@@ -994,9 +1078,17 @@ mod tests {
         let (_stop, cancel) = bounded(0);
         let (_recycle, recycled) = bounded(1);
         assert_eq!(
-            read_output(FailedIo, FilterChain::default(), None, tx, cancel, recycled)
-                .unwrap_err()
-                .to_string(),
+            read_output(
+                FailedIo,
+                FilterChain::default(),
+                None,
+                tx,
+                cancel,
+                recycled,
+                None
+            )
+            .unwrap_err()
+            .to_string(),
             "read PTY output"
         );
         drop(rx);

@@ -53,28 +53,30 @@ fn cursor_cleanup_recovers_incomplete_output_without_mouse_ui() {
 
 #[test]
 fn queued_output_is_drained_before_cleanup_and_child_status_is_preserved() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tfil"))
-        .args([
-            "--strip-ink-fake-cursor",
-            "--strip-cursor-shape",
-            "--strip-osc-titles",
-            "--codex-mouse-ui",
-            "--tmux-osc-passthrough=22,52",
-            "--",
-            "/bin/sh",
-            "-c",
-            "dd if=/dev/zero bs=65536 count=64 2>/dev/null; exit 42",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    // Keep stdin open so the PTY's cooked-mode EOF echo is not part of the stream.
-    let _input = child.stdin.take();
-    let output = child.wait_with_output().unwrap();
-    assert_eq!(output.status.code(), Some(42));
-    let (data, cleanup) = output.stdout.split_at(65536 * 64);
-    assert!(data.iter().all(|&byte| byte == 0));
-    assert_eq!(cleanup, b"\x1b[?25h");
+    for mouse_args in [&[][..], &["--codex-mouse-ui"][..]] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_tfil"))
+            .args(mouse_args)
+            .args([
+                "--strip-ink-fake-cursor",
+                "--strip-cursor-shape",
+                "--strip-osc-titles",
+                "--tmux-osc-passthrough=22,52",
+                "--",
+                "/bin/sh",
+                "-c",
+                "dd if=/dev/zero bs=65536 count=64 2>/dev/null; exit 42",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Keep stdin open so the PTY's cooked-mode EOF echo is not part of the stream.
+        let _input = child.stdin.take();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(42));
+        let (data, cleanup) = output.stdout.split_at(65536 * 64);
+        assert!(data.iter().all(|&byte| byte == 0));
+        assert_eq!(cleanup, b"\x1b[?25h");
+    }
 }
