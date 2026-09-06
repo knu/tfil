@@ -5,22 +5,24 @@ use vtparse::{CsiParam, VTActor, VTParser};
 /// threads.  Controls must wait for a complete escape sequence or UTF-8 character.
 pub(crate) struct TerminalOutput<W> {
     writer: W,
-    parser: Option<VTParser>,
+    parser: Option<SequenceTracker>,
     pending: Vec<u8>,
+    finished: bool,
 }
 
 impl<W: Write> TerminalOutput<W> {
     pub(crate) fn new(writer: W, track_sequences: bool) -> Self {
         Self {
             writer,
-            parser: track_sequences.then(VTParser::new),
+            parser: track_sequences.then(SequenceTracker::new),
             pending: Vec::new(),
+            finished: false,
         }
     }
 
     pub(crate) fn write_child(&mut self, bytes: &[u8], extra: &[u8]) -> io::Result<()> {
         if let Some(parser) = &mut self.parser {
-            parser.parse(bytes, &mut IgnoreActions);
+            parser.parse(bytes);
         }
         self.writer.write_all(bytes)?;
         self.write_extra(extra)
@@ -28,23 +30,112 @@ impl<W: Write> TerminalOutput<W> {
 
     /// `bytes` must contain only complete terminal control sequences.
     pub(crate) fn write_extra(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
         self.pending.extend_from_slice(bytes);
-        if self.parser.as_ref().is_none_or(VTParser::is_ground) {
+        if self.parser.as_ref().is_none_or(SequenceTracker::is_ground) {
             self.writer.write_all(&self.pending)?;
             self.pending.clear();
         }
         self.writer.flush()
     }
+
+    /// Ends the child stream and restores terminal modes.  Late input-thread
+    /// updates and queued controls must not re-enable modes after cleanup.
+    pub(crate) fn finish(&mut self, controls: &[u8]) -> io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        self.pending.clear();
+        if self.parser.as_ref().is_some_and(|p| !p.is_ground()) {
+            // CAN cancels ordinary sequences and incomplete UTF-8.  tmux DCS
+            // treats CAN as payload, so also send ST; the leading CAN consumes
+            // any dangling DCS escape, and the trailing CAN cancels its payload.
+            self.writer.write_all(b"\x18\x1b\\\x18")?;
+        }
+        self.writer.write_all(controls)?;
+        self.writer.flush()
+    }
 }
 
-struct IgnoreActions;
+struct SequenceTracker {
+    parser: VTParser,
+    actions: BoundaryActions,
+}
 
-impl VTActor for IgnoreActions {
+impl SequenceTracker {
+    fn new() -> Self {
+        Self {
+            parser: VTParser::new(),
+            actions: BoundaryActions::default(),
+        }
+    }
+
+    fn parse(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            match self.actions.tmux {
+                TmuxState::Payload => {
+                    if byte == 0x1b {
+                        self.actions.tmux = TmuxState::Escape;
+                    }
+                }
+                TmuxState::Escape => {
+                    if byte == b'\\' {
+                        self.parser = VTParser::new();
+                        self.actions.tmux = TmuxState::None;
+                    } else {
+                        self.actions.tmux = TmuxState::Payload;
+                    }
+                }
+                _ => self.parser.parse_byte(byte, &mut self.actions),
+            }
+        }
+    }
+
+    fn is_ground(&self) -> bool {
+        self.parser.is_ground() && self.actions.tmux == TmuxState::None
+    }
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum TmuxState {
+    #[default]
+    None,
+    Prefix(usize),
+    Payload,
+    Escape,
+}
+
+#[derive(Default)]
+struct BoundaryActions {
+    tmux: TmuxState,
+}
+
+impl VTActor for BoundaryActions {
     fn print(&mut self, _: char) {}
     fn execute_c0_or_c1(&mut self, _: u8) {}
-    fn dcs_hook(&mut self, _: u8, _: &[i64], _: &[u8], _: bool) {}
-    fn dcs_put(&mut self, _: u8) {}
-    fn dcs_unhook(&mut self) {}
+    fn dcs_hook(&mut self, byte: u8, params: &[i64], intermediates: &[u8], ignored: bool) {
+        if byte == b't' && params.is_empty() && intermediates.is_empty() && !ignored {
+            self.tmux = TmuxState::Prefix(0);
+        }
+    }
+    fn dcs_put(&mut self, byte: u8) {
+        if let TmuxState::Prefix(index) = self.tmux {
+            self.tmux = if byte != b"mux;"[index] {
+                TmuxState::None
+            } else if index == 3 {
+                // vtparse's normal DCS rules do not understand doubled ESC.
+                TmuxState::Payload
+            } else {
+                TmuxState::Prefix(index + 1)
+            };
+        }
+    }
+    fn dcs_unhook(&mut self) {
+        self.tmux = TmuxState::None;
+    }
     fn esc_dispatch(&mut self, _: &[i64], _: &[u8], _: bool, _: u8) {}
     fn csi_dispatch(&mut self, _: &[CsiParam], _: bool, _: u8) {}
     fn osc_dispatch(&mut self, _: &[&[u8]]) {}
@@ -110,6 +201,101 @@ mod tests {
             [b"text\x1b[?2026l".as_slice(), MOUSE_ENABLE, POINTER_ON].concat()
         );
         assert!(output.pending.is_empty());
+    }
+
+    #[test]
+    fn controls_wait_for_the_outer_tmux_terminator() {
+        for payload in [
+            b"\x1b[31mred\x1b[0m".to_vec(),
+            POINTER_ON.to_vec(),
+            b"\x1b]0;title\x1b\\".to_vec(),
+            tmux_wrap(POINTER_ON),
+            b"\x18\x1a\x9c\x1b\\".to_vec(),
+        ] {
+            let sequence = tmux_wrap(&payload);
+            for split in 1..sequence.len() {
+                let mut output = TerminalOutput::new(Vec::new(), true);
+                output
+                    .write_child(&sequence[..split], MOUSE_ENABLE)
+                    .unwrap();
+                output.write_extra(POINTER_ON).unwrap();
+                assert_eq!(output.writer, sequence[..split], "split {split}");
+                output.write_child(&sequence[split..], &[]).unwrap();
+                assert_eq!(
+                    output.writer,
+                    [sequence.as_slice(), MOUSE_ENABLE, POINTER_ON].concat(),
+                    "split {split}"
+                );
+            }
+            let mut output = TerminalOutput::new(Vec::new(), true);
+            for &byte in &sequence {
+                output.write_child(&[byte], &[]).unwrap();
+                output.write_extra(POINTER_ON).unwrap();
+            }
+            assert_eq!(
+                output.writer,
+                [sequence.as_slice(), &POINTER_ON.repeat(sequence.len())].concat()
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_sequences_do_not_enter_tmux_passthrough() {
+        for sequence in [
+            b"\x1b]0;tmux;title\x07".as_slice(),
+            b"\x1bPtmu\x18",
+            b"\x1bPtmuxx;\x18",
+            b"\x1bP1tmux;\x18",
+            b"\x1bPt\x18mux;",
+        ] {
+            let mut output = TerminalOutput::new(Vec::new(), true);
+            output.write_child(sequence, POINTER_ON).unwrap();
+            assert_eq!(output.writer, [sequence, POINTER_ON].concat());
+        }
+    }
+
+    #[test]
+    fn finish_recovers_incomplete_sequences_before_restoring_modes() {
+        let cleanup = b"\x1b[?1000l\x1b[?25h";
+        for sequence in [
+            b"\x1b[?2026l".to_vec(),
+            b"\x1b]0;title\x1b\\".to_vec(),
+            b"\x1bP1;2qpayload\x1b\\".to_vec(),
+            b"\x1b_Gpayload\x1b\\".to_vec(),
+            "日".as_bytes().to_vec(),
+            tmux_wrap(POINTER_ON),
+        ] {
+            for split in 1..sequence.len() {
+                let mut output = TerminalOutput::new(Vec::new(), true);
+                output
+                    .write_child(&sequence[..split], MOUSE_ENABLE)
+                    .unwrap();
+                output.finish(cleanup).unwrap();
+                assert_eq!(
+                    output.writer,
+                    [&sequence[..split], b"\x18\x1b\\\x18", cleanup].concat(),
+                    "{sequence:?}, split {split}"
+                );
+                assert!(output.pending.is_empty());
+                let mut tracker = SequenceTracker::new();
+                tracker.parse(&output.writer);
+                assert!(tracker.is_ground());
+                output.write_extra(MOUSE_ENABLE).unwrap();
+                output.finish(cleanup).unwrap();
+                assert!(output.writer.ends_with(cleanup));
+                assert_eq!(output.writer.len(), split + 4 + cleanup.len());
+            }
+        }
+    }
+
+    #[test]
+    fn finish_preserves_complete_output_without_cancellation() {
+        for track in [false, true] {
+            let mut output = TerminalOutput::new(Vec::new(), track);
+            output.write_child(b"done", &[]).unwrap();
+            output.finish(b"\x1b[?25h").unwrap();
+            assert_eq!(output.writer, b"done\x1b[?25h");
+        }
     }
 
     #[test]
