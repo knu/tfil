@@ -21,6 +21,12 @@ impl<W: Write> TerminalOutput<W> {
     }
 
     pub(crate) fn write_child(&mut self, bytes: &[u8], extra: &[u8]) -> io::Result<()> {
+        if self.finished {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "terminal output closed",
+            ));
+        }
         if let Some(parser) = &mut self.parser {
             parser.parse(bytes);
         }
@@ -296,6 +302,19 @@ mod tests {
             output.finish(b"\x1b[?25h").unwrap();
             assert_eq!(output.writer, b"done\x1b[?25h");
         }
+    }
+
+    #[test]
+    fn child_output_cannot_write_after_finish() {
+        let mut output = TerminalOutput::new(Vec::new(), true);
+        output.finish(b"\x1b[?25h").unwrap();
+        let error = output
+            .write_child(b"late output", MOUSE_ENABLE)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        output.write_extra(POINTER_ON).unwrap();
+        assert_eq!(output.writer, b"\x1b[?25h");
+        assert!(output.pending.is_empty());
     }
 
     #[test]

@@ -1,4 +1,35 @@
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+#[test]
+fn broken_output_stops_a_child_that_keeps_writing() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tfil"))
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "while :; do printf 'output\\n'; done",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(1));
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("tfil did not stop after stdout closed");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 #[test]
 fn cursor_cleanup_recovers_incomplete_output_without_mouse_ui() {

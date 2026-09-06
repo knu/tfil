@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
 use std::ffi::OsString;
@@ -254,38 +254,19 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
     // child -> filter -> stdout
     let debug_dump = debug_dump_path(cli.debug_dump.as_deref());
     let stdout_thread = {
-        let done = done.clone();
-        let mut dump = debug_dump.as_deref().and_then(open_dump_file);
+        let dump = debug_dump.as_deref().and_then(open_dump_file);
         let mouse = mouse.clone();
         let terminal = terminal.clone();
         thread::spawn(move || -> Result<()> {
             let mut filters = filters;
-            let mut buf = [0u8; 65536];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if let Some(f) = dump.as_mut() {
-                            let _ = f.write_all(&buf[..n]);
-                            let _ = f.flush();
-                        }
-                        let out = filters.filter(&buf[..n]);
-                        let extra = mouse
-                            .as_ref()
-                            .map(|m| m.lock().unwrap().on_output(&out))
-                            .unwrap_or_default();
-                        terminal.lock().unwrap().write_child(&out, &extra)?;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                }
-            }
-            let pending = filters.finish();
-            if !pending.is_empty() {
-                terminal.lock().unwrap().write_child(&pending, &[])?;
-            }
-            done.store(true, Ordering::SeqCst);
-            Ok(())
+            forward_output(&mut reader, &mut filters, dump, |out| {
+                let extra = mouse
+                    .as_ref()
+                    .map(|m| m.lock().unwrap().on_output(out))
+                    .unwrap_or_default();
+                terminal.lock().unwrap().write_child(out, &extra)?;
+                Ok(())
+            })
         })
     };
 
@@ -353,13 +334,21 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
         }
     });
 
-    let status = child.wait().context("wait failed")?;
+    // Observe output failures before waiting: a child blocked writing to its
+    // PTY cannot exit if the forwarding thread has already failed.
+    let output_result = stdout_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("output thread panicked"))
+        .and_then(|result| result);
     done.store(true, Ordering::SeqCst);
-    let _ = stdout_thread.join();
+    if output_result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait().context("wait failed");
 
     let mouse_active = mouse
         .as_ref()
-        .is_some_and(|mouse| mouse.lock().unwrap().is_active());
+        .is_some_and(|mouse| mouse.lock().unwrap_or_else(|e| e.into_inner()).is_active());
     let mut cleanup = Vec::new();
     if mouse_active {
         cleanup.extend_from_slice(MOUSE_DISABLE);
@@ -372,8 +361,53 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
     if cli.strip_ink_fake_cursor {
         cleanup.extend_from_slice(CURSOR_SHOW);
     }
-    let _ = terminal.lock().unwrap().finish(&cleanup);
+    finish_session(
+        &mut terminal.lock().unwrap_or_else(|e| e.into_inner()),
+        &cleanup,
+        output_result,
+        status,
+    )
+}
 
+fn forward_output(
+    reader: &mut dyn Read,
+    filters: &mut FilterChain,
+    mut dump: Option<std::fs::File>,
+    mut emit: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut buf = [0u8; 65536];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Some(file) = dump.as_mut() {
+                    let _ = file.write_all(&buf[..n]);
+                    let _ = file.flush();
+                }
+                emit(&filters.filter(&buf[..n])).context("write terminal output")?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            // portable-pty converts the slave's closing EIO to EOF.
+            Err(e) => return Err(e).context("read PTY output"),
+        }
+    }
+    let pending = filters.finish();
+    if !pending.is_empty() {
+        emit(&pending).context("write terminal output")?;
+    }
+    Ok(())
+}
+
+fn finish_session<W: Write>(
+    terminal: &mut TerminalOutput<W>,
+    cleanup: &[u8],
+    output_result: Result<()>,
+    status: Result<ExitStatus>,
+) -> Result<i32> {
+    let restored = terminal.finish(cleanup).context("restore terminal modes");
+    output_result?;
+    let status = status?;
+    restored?;
     Ok(status.exit_code() as i32)
 }
 
@@ -464,6 +498,110 @@ impl Drop for RawModeGuard {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn eof_output_updates_the_mouse_model() {
+        let mut filters = FilterChain::new(vec![Box::new(InkFakeCursorFilter::new())]);
+        let input = b"\x1b[7m \x1b[?2004h";
+        let mut mouse = CodexMouseUi::new(24, 80);
+        let mut output = Vec::new();
+        forward_output(&mut input.as_slice(), &mut filters, None, |bytes| {
+            mouse.on_output(bytes);
+            output.extend_from_slice(bytes);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(output, input);
+        assert!(mouse.is_active());
+    }
+
+    struct FailedReader;
+    impl Read for FailedReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("read failure"))
+        }
+    }
+
+    #[test]
+    fn forwarding_reports_read_and_write_failures() {
+        let read_error = forward_output(
+            &mut FailedReader,
+            &mut FilterChain::default(),
+            None,
+            |_| unreachable!(),
+        )
+        .unwrap_err();
+        assert_eq!(read_error.to_string(), "read PTY output");
+
+        let write_error = forward_output(
+            &mut b"output".as_slice(),
+            &mut FilterChain::default(),
+            None,
+            |_| Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed").into()),
+        )
+        .unwrap_err();
+        assert_eq!(write_error.to_string(), "write terminal output");
+    }
+
+    #[test]
+    fn session_restores_modes_before_returning_errors() {
+        for fail_output in [false, true] {
+            let mut bytes = Vec::new();
+            let mut terminal = TerminalOutput::new(&mut bytes, true);
+            terminal.write_child(b"\x1b[?20", &[]).unwrap();
+            let output = if fail_output {
+                Err(anyhow::anyhow!("output failure"))
+            } else {
+                Ok(())
+            };
+            let error = finish_session(
+                &mut terminal,
+                CURSOR_SHOW,
+                output,
+                Err(anyhow::anyhow!("wait failure")),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                if fail_output {
+                    "output failure"
+                } else {
+                    "wait failure"
+                }
+            );
+            assert_eq!(bytes, b"\x1b[?20\x18\x1b\\\x18\x1b[?25h");
+        }
+    }
+
+    struct FailedWriter;
+    impl Write for FailedWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("write failure"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn session_reports_cleanup_failure_and_preserves_child_exit_code() {
+        let error = finish_session(
+            &mut TerminalOutput::new(FailedWriter, true),
+            CURSOR_SHOW,
+            Ok(()),
+            Ok(ExitStatus::with_exit_code(0)),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "restore terminal modes");
+        let code = finish_session(
+            &mut TerminalOutput::new(io::sink(), true),
+            CURSOR_SHOW,
+            Ok(()),
+            Ok(ExitStatus::with_exit_code(42)),
+        )
+        .unwrap();
+        assert_eq!(code, 42);
+    }
 
     #[test]
     fn debug_dump_path_uses_env_when_cli_is_absent() {
