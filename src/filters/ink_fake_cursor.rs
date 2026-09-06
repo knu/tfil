@@ -3,16 +3,14 @@ use memchr::memchr;
 use std::borrow::Cow;
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Strips Ink-style fake cursor sequences and the cursor-hide
-/// directive (`\x1b[?25l`).
+/// Strips Ink-style fake cursor sequences and cursor-hide directives.
 ///
-/// Ink draws its own block cursor by wrapping a single grapheme cluster
-/// in `\x1b[7m...\x1b[27m` (or `\x1b[m`) while keeping the real cursor
-/// hidden. This filter removes those wrappers so the terminal's native
-/// cursor shows through.
+/// Ink wraps a single grapheme in inverse SGRs.  Keep the original bytes
+/// until the closing SGR confirms that the candidate is a fake cursor.
 #[derive(Debug, Default)]
 pub struct InkFakeCursorFilter {
     pending: Vec<u8>,
+    opening_len: Option<usize>,
 }
 
 impl InkFakeCursorFilter {
@@ -20,19 +18,28 @@ impl InkFakeCursorFilter {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn flush_pending(&mut self, out: &mut Vec<u8>) {
+        self.opening_len = None;
+        if self.pending.last() == Some(&0x1b) {
+            out.extend_from_slice(&self.pending[..self.pending.len() - 1]);
+            self.pending.clear();
+            self.pending.push(0x1b);
+        } else {
+            out.append(&mut self.pending);
+        }
+    }
 }
 
 impl Filter for InkFakeCursorFilter {
     fn filter<'a>(&mut self, data: &'a [u8]) -> Cow<'a, [u8]> {
-        if self.pending.is_empty() && memchr(0x1B, data).is_none() {
+        if self.pending.is_empty() && memchr(0x1b, data).is_none() {
             return Cow::Borrowed(data);
         }
-
         let mut output = Vec::with_capacity(data.len());
-
         for &byte in data {
             if self.pending.is_empty() {
-                if byte == 0x1B {
+                if byte == 0x1b {
                     self.pending.push(byte);
                 } else {
                     output.push(byte);
@@ -41,309 +48,161 @@ impl Filter for InkFakeCursorFilter {
             }
 
             self.pending.push(byte);
-
-            if is_cursor_hide(&self.pending) {
-                self.pending.clear();
+            if let Some(opening_len) = self.opening_len {
+                if byte == b'm'
+                    && let Some(end_start) = self.pending.iter().rposition(|&b| b == 0x1b)
+                    && end_start >= opening_len
+                    && let Some(end) = Sgr::parse(&self.pending[end_start..])
+                    && (end.reset || end.inverse_off)
+                {
+                    let inner = &self.pending[opening_len..end_start];
+                    if !inner.is_empty()
+                        && printable_text_without_cursor_moves(inner)
+                            .is_some_and(|text| text.graphemes(true).count() == 1)
+                    {
+                        // Only render residual SGRs after recognition succeeds.
+                        Sgr::parse(&self.pending[..opening_len])
+                            .expect("validated opening SGR")
+                            .write_without(7, &mut output);
+                        output.extend_from_slice(inner);
+                        if !end.reset {
+                            end.write_without(27, &mut output);
+                        }
+                        self.pending.clear();
+                        self.opening_len = None;
+                        continue;
+                    }
+                    self.flush_pending(&mut output);
+                } else if self.pending.len() > MAX_PENDING_FAKE_CURSOR_LEN {
+                    self.flush_pending(&mut output);
+                }
                 continue;
             }
 
-            if is_fake_cursor(&self.pending) {
-                let payload = fake_cursor_payload(&self.pending);
-                if let Some(leading) = payload.leading_residual {
-                    output.extend_from_slice(&leading);
-                }
-                output.extend_from_slice(payload.inner);
-                if let Some(trailing) = payload.trailing_residual {
-                    output.extend_from_slice(&trailing);
-                }
+            if self.pending == b"\x1b[?25l" {
                 self.pending.clear();
+            } else if is_incomplete_csi(&self.pending) || b"\x1b[?25l".starts_with(&self.pending) {
                 continue;
-            }
-
-            if is_incomplete_csi(&self.pending)
-                || is_cursor_hide_prefix(&self.pending)
-                || is_fake_cursor_prefix(&self.pending)
+            } else if byte == b'm'
+                && self.pending.len() <= MAX_PENDING_FAKE_CURSOR_LEN
+                && Sgr::parse(&self.pending).is_some_and(|sgr| sgr.inverse_on && !sgr.reset)
             {
-                continue;
+                self.opening_len = Some(self.pending.len());
+            } else {
+                self.flush_pending(&mut output);
             }
-
-            if byte == 0x1B {
-                output.extend_from_slice(&self.pending[..self.pending.len() - 1]);
-                self.pending.clear();
-                self.pending.push(byte);
-                continue;
-            }
-
-            output.extend_from_slice(&self.pending);
-            self.pending.clear();
         }
-
         Cow::Owned(output)
     }
 
     fn finish(&mut self) -> Vec<u8> {
+        self.opening_len = None;
         std::mem::take(&mut self.pending)
     }
 }
 
-// Inner payload is at most one grapheme cluster, possibly preceded by CR and
-// CSI cursor-move sequences. ZWJ emoji clusters can run up to ~28 bytes (e.g.
-// the 4-person family), so cap generously.
+// Bound speculative buffering while allowing a full ZWJ grapheme and cursor moves.
 const MAX_PENDING_FAKE_CURSOR_LEN: usize = 64;
 
-fn is_incomplete_csi(data: &[u8]) -> bool {
-    let Some(param_start) = csi_param_start(data) else {
-        return false;
-    };
-
-    !data[param_start..]
-        .iter()
-        .any(|b| (0x40..=0x7E).contains(b))
-}
-
 fn csi_param_start(data: &[u8]) -> Option<usize> {
-    if data.starts_with(b"\x1b[") {
-        Some(2)
-    } else {
-        None
+    data.starts_with(b"\x1b[").then_some(2)
+}
+
+fn is_incomplete_csi(data: &[u8]) -> bool {
+    csi_param_start(data)
+        .is_some_and(|start| !data[start..].iter().any(|b| (0x40..=0x7e).contains(b)))
+}
+
+/// A validated SGR borrows its original parameters; recognition allocates nothing.
+struct Sgr<'a> {
+    params: &'a [u8],
+    reset: bool,
+    inverse_on: bool,
+    inverse_off: bool,
+}
+
+impl<'a> Sgr<'a> {
+    fn parse(data: &'a [u8]) -> Option<Self> {
+        let params = data.strip_prefix(b"\x1b[")?.strip_suffix(b"m")?;
+        let mut sgr = Self {
+            params,
+            reset: false,
+            inverse_on: false,
+            inverse_off: false,
+        };
+        visit_sgr_params(params, |code, _| match code {
+            Some(0) => sgr.reset = true,
+            Some(7) => sgr.inverse_on = true,
+            Some(27) => sgr.inverse_off = true,
+            _ => {}
+        })?;
+        Some(sgr)
     }
-}
 
-fn is_cursor_hide(data: &[u8]) -> bool {
-    data == b"\x1b[?25l"
-}
-
-fn is_cursor_hide_prefix(data: &[u8]) -> bool {
-    b"\x1b[?25l".starts_with(data)
-}
-
-/// Shortest possible inverse-enabling SGR. Used only for prefix tracking
-/// while bytes are still arriving; classification uses [`fake_cursor_start`].
-const MIN_FAKE_CURSOR_START: &[u8] = b"\x1b[7m";
-
-/// Describes the leading SGR that enables inverse for a fake cursor.
-///
-/// Ink usually emits `\x1b[7m` on its own, but it sometimes folds the
-/// inverse-on into a compound SGR that also resets the previous cell's
-/// attributes, e.g. `\x1b[39;7m` (default foreground + inverse-on). We
-/// strip the `7` and keep any remaining parameters as `residual` so the
-/// surrounding attribute state still resolves correctly.
-struct FakeCursorStart {
-    len: usize,
-    residual: Option<Vec<u8>>,
-}
-
-/// Describes the trailing SGR sequence that closes a fake cursor.
-///
-/// `len` is the byte length of that SGR (including the leading ESC `[`
-/// and trailing `m`). `residual` is `Some(rewritten)` when the SGR
-/// carried unrelated parameters that must be preserved in the output
-/// after stripping the inverse-off marker — for example `\x1b[38;5;244;27m`
-/// becomes `\x1b[38;5;244m`. It is `None` when the entire SGR was just a
-/// reset (`\x1b[m`, `\x1b[0m`, `\x1b[27m`, `\x1b[2;27m`, etc.) and can
-/// be discarded outright.
-struct FakeCursorEnd {
-    len: usize,
-    residual: Option<Vec<u8>>,
-}
-
-/// Recognizes the leading inverse-on SGR. Returns `Some` when `data`
-/// begins with an SGR whose parameter list contains `7` (and no `0`
-/// reset — a reset would cancel the inverse before any text). The
-/// returned `residual` re-emits the non-`7` parameters as their own SGR
-/// so the surrounding attribute state survives.
-fn fake_cursor_start(data: &[u8]) -> Option<FakeCursorStart> {
-    if !data.starts_with(b"\x1b[") {
-        return None;
-    }
-    let after_intro = &data[2..];
-    let final_index = after_intro.iter().position(|b| (0x40..=0x7E).contains(b))?;
-    if after_intro[final_index] != b'm' {
-        return None;
-    }
-    let params = &after_intro[..final_index];
-    let mut found = false;
-    let mut kept: Vec<&[u8]> = Vec::new();
-    for part in params.split(|&b| b == b';') {
-        if !part.iter().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        match part {
-            b"7" => {
-                found = true;
+    fn write_without(&self, removed: u16, out: &mut Vec<u8>) {
+        let mut first = true;
+        visit_sgr_params(self.params, |code, raw| {
+            if code == Some(removed) {
+                return;
             }
-            // A `0` (or empty, which terminals treat as 0) inside the
-            // start SGR would reset attributes after enabling inverse,
-            // so it cannot mark the opening of a fake cursor.
-            b"0" | b"" => return None,
-            _ => kept.push(part),
-        }
-    }
-    if !found {
-        return None;
-    }
-    let residual = if kept.is_empty() {
-        None
-    } else {
-        let mut out = Vec::with_capacity(3 + kept.iter().map(|p| p.len() + 1).sum::<usize>());
-        out.extend_from_slice(b"\x1b[");
-        for (i, part) in kept.iter().enumerate() {
-            if i > 0 {
+            if first {
+                out.extend_from_slice(b"\x1b[");
+                first = false;
+            } else {
                 out.push(b';');
             }
-            out.extend_from_slice(part);
-        }
-        out.push(b'm');
-        Some(out)
-    };
-    Some(FakeCursorStart {
-        len: 2 + final_index + 1,
-        residual,
-    })
-}
-
-/// True when `data` could still grow into a fake-cursor opening SGR.
-fn is_fake_cursor_start_prefix(data: &[u8]) -> bool {
-    if !data.starts_with(b"\x1b") {
-        return false;
-    }
-    if data == b"\x1b" {
-        return true;
-    }
-    if !data.starts_with(b"\x1b[") {
-        return false;
-    }
-    let params = &data[2..];
-    // No final byte yet: still parameters/intermediates; must remain valid digits or ';'.
-    params.iter().all(|b| b.is_ascii_digit() || *b == b';')
-}
-
-/// Ink uses several variants to leave the inverse-attribute state:
-/// `\x1b[m` (full reset), `\x1b[0m`, `\x1b[27m`, `\x1b[2;27m`, or even
-/// SGRs that bundle inverse-off with the next cell's attributes such as
-/// `\x1b[38;5;244;27m`. We recognize any SGR whose parameter list
-/// contains `0` or `27` (or is empty, i.e. a bare reset).
-fn fake_cursor_end(data: &[u8]) -> Option<FakeCursorEnd> {
-    if !data.ends_with(b"m") {
-        return None;
-    }
-    // Walk back to find the matching ESC '['.
-    let bytes = &data[..data.len() - 1];
-    let start = bytes.iter().rposition(|&b| b == 0x1B)?;
-    if !bytes[start..].starts_with(b"\x1b[") {
-        return None;
-    }
-    let params = &bytes[start + 2..];
-    if params.is_empty() {
-        return Some(FakeCursorEnd {
-            len: data.len() - start,
-            residual: None,
-        });
-    }
-    let mut found = false;
-    let mut kept: Vec<&[u8]> = Vec::new();
-    let mut full_reset = false;
-    for part in params.split(|&b| b == b';') {
-        if !part.iter().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        match part {
-            b"0" => {
-                found = true;
-                full_reset = true;
-            }
-            b"27" => {
-                found = true;
-            }
-            b"" => {
-                // Empty parameter inside a list (e.g. `;;`) is treated as 0
-                // by terminals; keep parity with the discard path.
-                found = true;
-                full_reset = true;
-            }
-            _ => kept.push(part),
+            out.extend_from_slice(raw);
+        })
+        .expect("validated SGR parameters");
+        if !first {
+            out.push(b'm');
         }
     }
-    if !found {
-        return None;
-    }
-    let residual = if full_reset || kept.is_empty() {
-        None
-    } else {
-        let mut out = Vec::with_capacity(3 + kept.iter().map(|p| p.len() + 1).sum::<usize>());
-        out.extend_from_slice(b"\x1b[");
-        for (i, part) in kept.iter().enumerate() {
-            if i > 0 {
-                out.push(b';');
+}
+
+/// Visits semantic parameters, keeping extended-color arguments together.
+/// Colon-delimited subparameters are already contained in one raw field.
+fn visit_sgr_params(params: &[u8], mut visit: impl FnMut(Option<u16>, &[u8])) -> Option<()> {
+    let mut fields = params.split(|&b| b == b';');
+    let mut offset = 0;
+    while let Some(field) = fields.next() {
+        let start = offset;
+        offset += field.len() + 1;
+        let code = if field.contains(&b':') {
+            if !field.iter().all(|b| b.is_ascii_digit() || *b == b':') {
+                return None;
             }
-            out.extend_from_slice(part);
-        }
-        out.push(b'm');
-        Some(out)
-    };
-    Some(FakeCursorEnd {
-        len: data.len() - start,
-        residual,
-    })
-}
-
-fn is_fake_cursor(data: &[u8]) -> bool {
-    let Some(start) = fake_cursor_start(data) else {
-        return false;
-    };
-    let Some(end) = fake_cursor_end(data) else {
-        return false;
-    };
-    if start.len + end.len > data.len() {
-        return false;
+            None
+        } else {
+            if !field.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            let code = if field.is_empty() {
+                Some(0)
+            } else {
+                std::str::from_utf8(field).ok()?.parse::<u16>().ok()
+            };
+            if matches!(code, Some(38 | 48 | 58)) {
+                let mode = fields.next()?;
+                offset += mode.len() + 1;
+                let count = match mode {
+                    b"5" => 1,
+                    b"2" => 3,
+                    _ => return None,
+                };
+                for _ in 0..count {
+                    let value = fields.next()?;
+                    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+                        return None;
+                    }
+                    offset += value.len() + 1;
+                }
+            }
+            code
+        };
+        visit(code, &params[start..offset - 1]);
     }
-    is_fake_cursor_inner(&data[start.len..data.len() - end.len])
-}
-
-fn is_fake_cursor_prefix(data: &[u8]) -> bool {
-    if data.is_empty() {
-        return false;
-    }
-    if is_fake_cursor_start_prefix(data) && fake_cursor_start(data).is_none() {
-        return true;
-    }
-    if fake_cursor_start(data).is_some()
-        && data.len() <= MAX_PENDING_FAKE_CURSOR_LEN
-        && fake_cursor_end(data).is_none()
-    {
-        return true;
-    }
-    // Also accept the legacy minimum prefix (`\x1b`, `\x1b[`, `\x1b[7`)
-    // so we keep buffering until enough bytes arrive to classify.
-    MIN_FAKE_CURSOR_START.starts_with(data) && data.len() < MIN_FAKE_CURSOR_START.len()
-}
-
-fn is_fake_cursor_inner(data: &[u8]) -> bool {
-    !data.is_empty()
-        && printable_text_without_cursor_moves(data)
-            .is_some_and(|text| text.graphemes(true).count() == 1)
-}
-
-struct FakeCursorPayload<'a> {
-    leading_residual: Option<Vec<u8>>,
-    inner: &'a [u8],
-    trailing_residual: Option<Vec<u8>>,
-}
-
-fn fake_cursor_payload(data: &[u8]) -> FakeCursorPayload<'_> {
-    let (start_len, leading_residual) = match fake_cursor_start(data) {
-        Some(start) => (start.len, start.residual),
-        None => (0, None),
-    };
-    let (end_len, trailing_residual) = match fake_cursor_end(data) {
-        Some(end) => (end.len, end.residual),
-        None => (0, None),
-    };
-    FakeCursorPayload {
-        leading_residual,
-        inner: &data[start_len..data.len() - end_len],
-        trailing_residual,
-    }
+    Some(())
 }
 
 fn printable_text_without_cursor_moves(data: &[u8]) -> Option<String> {
@@ -384,6 +243,36 @@ fn skip_csi(data: &[u8], index: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grouped_colors_survive_fake_cursor_recognition_at_every_split() {
+        for (input, expected) in [
+            ("\x1b[38;5;7mX\x1b[27m", "\x1b[38;5;7mX\x1b[27m"),
+            ("\x1b[7mX\x1b[38;5;27m", "\x1b[7mX\x1b[38;5;27m"),
+            (
+                "\x1b[38;5;7;7mX\x1b[48;5;27;27m",
+                "\x1b[38;5;7mX\x1b[48;5;27m",
+            ),
+            (
+                "\x1b[38;2;0;7;27;7mX\x1b[58;2;27;0;7;27m",
+                "\x1b[38;2;0;7;27mX\x1b[58;2;27;0;7m",
+            ),
+            (
+                "\x1b[38:2::0:7:27;7m日\x1b[48:5:27;27m",
+                "\x1b[38:2::0:7:27m日\x1b[48:5:27m",
+            ),
+            ("\x1b[38;2;7mX\x1b[27m", "\x1b[38;2;7mX\x1b[27m"),
+        ] {
+            for split in 0..=input.len() {
+                let mut filter = InkFakeCursorFilter::new();
+                let bytes = input.as_bytes();
+                let mut output = filter.filter(&bytes[..split]).into_owned();
+                output.extend_from_slice(&filter.filter(&bytes[split..]));
+                output.extend(filter.finish());
+                assert_eq!(output, expected.as_bytes(), "{input:?}, split {split}");
+            }
+        }
+    }
 
     #[test]
     fn test_cursor_filter_removes_cursor_hide() {
