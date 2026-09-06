@@ -416,6 +416,7 @@ dependencies = [
  "tempfile",
  "unicode-segmentation",
  "vt100",
+ "vtparse",
 ]
 
 [[package]]
@@ -481,6 +482,15 @@ checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
 dependencies = [
  "arrayvec",
  "memchr",
+]
+
+[[package]]
+name = "vtparse"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1726b5dabcf18909219a11c1ae3b85fff931b6e5ccf7321d998fc7665f52661b"
+dependencies = [
+ "utf8parse",
 ]
 
 [[package]]

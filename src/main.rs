@@ -17,7 +17,10 @@ use tfil::filters::{
     tmux_wrap,
 };
 
+mod terminal_output;
 mod wrapper;
+
+use terminal_output::TerminalOutput;
 
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")");
 const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
@@ -236,6 +239,11 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
         Arc::new(Mutex::new(m))
     });
 
+    let terminal = Arc::new(Mutex::new(TerminalOutput::new(
+        io::stdout(),
+        mouse.is_some(),
+    )));
+
     // Always put our stdin in raw mode: line editing is the slave PTY's
     // job (its termios is cooked by default), so the parent must forward
     // every byte without local cooking.
@@ -248,11 +256,11 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
         let done = done.clone();
         let mut dump = debug_dump.as_deref().and_then(open_dump_file);
         let mouse = mouse.clone();
+        let terminal = terminal.clone();
         thread::spawn(move || -> Result<()> {
             let mut filters = filters;
             let mut buf = [0u8; 65536];
             let mut owned: Vec<u8> = Vec::new();
-            let stdout = io::stdout();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
@@ -265,13 +273,8 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
                         let extra = mouse
                             .as_ref()
                             .map(|m| m.lock().unwrap().on_output(out))
-                            .filter(|e| !e.is_empty());
-                        let mut lock = stdout.lock();
-                        lock.write_all(out)?;
-                        if let Some(extra) = extra {
-                            lock.write_all(&extra)?;
-                        }
-                        lock.flush()?;
+                            .unwrap_or_default();
+                        terminal.lock().unwrap().write_child(out, &extra)?;
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
@@ -279,9 +282,7 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
             }
             let pending = flush_filters(&mut filters);
             if !pending.is_empty() {
-                let mut lock = stdout.lock();
-                lock.write_all(&pending)?;
-                lock.flush()?;
+                terminal.lock().unwrap().write_child(&pending, &[])?;
             }
             done.store(true, Ordering::SeqCst);
             Ok(())
@@ -291,6 +292,7 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
     // stdin -> child
     let stdin_done = done.clone();
     let stdin_mouse = mouse.clone();
+    let stdin_terminal = terminal.clone();
     thread::spawn(move || {
         let mut buf = [0u8; 65536];
         let stdin = io::stdin();
@@ -303,9 +305,7 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
                     let data: &[u8] = if let Some(m) = &stdin_mouse {
                         let (child_bytes, term_bytes) = m.lock().unwrap().on_input(&buf[..n]);
                         if !term_bytes.is_empty() {
-                            let mut out = io::stdout().lock();
-                            let _ = out.write_all(&term_bytes);
-                            let _ = out.flush();
+                            let _ = stdin_terminal.lock().unwrap().write_extra(&term_bytes);
                         }
                         to_child = child_bytes;
                         &to_child
@@ -361,18 +361,16 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
         .as_ref()
         .is_some_and(|mouse| mouse.lock().unwrap().is_active());
     if mouse_active {
-        let mut lock = io::stdout().lock();
-        let _ = lock.write_all(MOUSE_DISABLE);
+        let mut lock = terminal.lock().unwrap();
+        let _ = lock.write_extra(MOUSE_DISABLE);
         if tmux_pointer {
-            let _ = lock.write_all(&tmux_wrap(POINTER_OFF));
+            let _ = lock.write_extra(&tmux_wrap(POINTER_OFF));
         } else {
-            let _ = lock.write_all(POINTER_OFF);
+            let _ = lock.write_extra(POINTER_OFF);
         }
-        let _ = lock.flush();
     }
     if cli.strip_ink_fake_cursor {
-        let _ = io::stdout().write_all(CURSOR_SHOW);
-        let _ = io::stdout().flush();
+        let _ = terminal.lock().unwrap().write_extra(CURSOR_SHOW);
     }
 
     Ok(status.exit_code() as i32)
