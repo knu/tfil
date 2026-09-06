@@ -8,6 +8,13 @@ version bumps for fixes.  Once `1.0.0` ships, the project will revisit and
 likely adopt strict [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.2.5] - 2026-09-06
+
+### Fixed
+
+- Fix launching commands with relative paths
+- Prevent terminal controls from splitting sequences
+
 ## [0.2.4] - 2026-09-02
 
 ### Fixed
