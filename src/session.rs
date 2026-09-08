@@ -324,7 +324,7 @@ impl Coordinator {
                 let (bytes, controls) = if let Some(mouse) = &mut self.mouse {
                     let result = mouse.on_input(&bytes);
                     self.input_deadline = mouse
-                        .has_pending_input()
+                        .needs_input_timeout()
                         .then(|| Instant::now() + INPUT_SEQUENCE_TIMEOUT);
                     result
                 } else {
@@ -352,11 +352,18 @@ impl Coordinator {
         }
     }
 
-    fn expire_input(&mut self, now: Instant) {
+    fn expire_input(&mut self, now: Instant, input: &Receiver<ReadEvent>) {
         if self.input == InputState::Reading
             && self.pending_child.is_none()
+            && self.pending_controls.is_none()
             && self.input_deadline.is_some_and(|deadline| now >= deadline)
         {
+            // A stalled writer or busy coordinator can leave continuation
+            // bytes queued past the deadline.  Parse them before timing out.
+            if let Ok(event) = input.try_recv() {
+                self.on_input(event);
+                return;
+            }
             self.input_deadline = None;
             let bytes = self.mouse.as_mut().unwrap().finish_input();
             self.pending_child = Some(InputCommand::Data(bytes));
@@ -435,7 +442,7 @@ impl Coordinator {
                 return self.error.map_or(result, Err);
             }
             self.prepare_commands(&mut stop);
-            self.expire_input(Instant::now());
+            self.expire_input(Instant::now(), &ports.input);
 
             let mut select = Select::new();
             let completed = select.recv(&ports.completed);
@@ -458,6 +465,7 @@ impl Coordinator {
                 .then(|| select.recv(&ports.resize));
             let operation = if self.input == InputState::Reading
                 && self.pending_child.is_none()
+                && self.pending_controls.is_none()
                 && let Some(deadline) = self.input_deadline
             {
                 match select.select_deadline(deadline) {
@@ -791,8 +799,15 @@ mod tests {
 
     impl Harness {
         fn start(coordinator: Coordinator) -> Self {
+            Self::start_with_input(coordinator, b"")
+        }
+
+        fn start_with_input(coordinator: Coordinator, bytes: &[u8]) -> Self {
             let (output, output_rx) = bounded(1);
             let (input, input_rx) = bounded(1);
+            if !bytes.is_empty() {
+                input.send(ReadEvent::Data(bytes.to_vec())).unwrap();
+            }
             // Rendezvous writers make backpressure deterministic.
             let (terminal_tx, terminal) = bounded(0);
             let (child_tx, child) = bounded(0);
@@ -1016,19 +1031,20 @@ mod tests {
 
     #[test]
     fn input_timeout_preserves_pending_child_and_resets_parser() {
-        for prefix in [b"\x1b".as_slice(), b"\x1b[", b"\x1b[<0;1;"] {
+        let (_tx, input) = bounded(1);
+        for prefix in [b"\x1b".as_slice(), b"\x1b["] {
             let mut mouse = CodexMouseUi::new(24, 80);
             mouse.on_output(b"\x1b[?2004h");
             let mut c = Coordinator::new(Some(mouse), false, false);
             c.on_input(ReadEvent::Data([b"a", prefix].concat()));
             let deadline = c.input_deadline.unwrap();
-            c.expire_input(deadline);
+            c.expire_input(deadline, &input);
             assert!(
                 matches!(c.pending_child.take(), Some(InputCommand::Data(bytes)) if bytes == b"a")
             );
-            c.expire_input(deadline - Duration::from_millis(1));
+            c.expire_input(deadline - Duration::from_millis(1), &input);
             assert!(c.pending_child.is_none());
-            c.expire_input(deadline);
+            c.expire_input(deadline, &input);
             assert!(
                 matches!(c.pending_child.take(), Some(InputCommand::Data(bytes)) if bytes == prefix)
             );
@@ -1042,14 +1058,15 @@ mod tests {
 
     #[test]
     fn input_sequences_completed_before_timeout_keep_their_meaning() {
+        let (_tx, input) = bounded(1);
         for sequence in [b"\x1b[A".as_slice(), b"\x1ba", b"\x1b[<0;1;1M"] {
             for split in 1..sequence.len() {
                 let mut mouse = CodexMouseUi::new(24, 80);
                 mouse.on_output(b"\x1b[?2004h");
                 let mut c = Coordinator::new(Some(mouse), false, false);
                 c.on_input(ReadEvent::Data(sequence[..split].to_vec()));
-                let deadline = c.input_deadline.unwrap();
-                c.expire_input(deadline - Duration::from_millis(1));
+                let deadline = Instant::now() + INPUT_SEQUENCE_TIMEOUT;
+                c.expire_input(deadline - Duration::from_millis(1), &input);
                 assert!(c.pending_child.is_none());
                 c.on_input(ReadEvent::Data(sequence[split..].to_vec()));
                 assert!(c.input_deadline.is_none());
@@ -1060,7 +1077,7 @@ mod tests {
                         matches!(c.pending_child.take(), Some(InputCommand::Data(bytes)) if bytes == sequence)
                     );
                 }
-                c.expire_input(deadline);
+                c.expire_input(deadline, &input);
                 assert!(c.pending_child.is_none());
             }
         }
@@ -1084,6 +1101,55 @@ mod tests {
             InputCommand::Eof
         ));
         h.finish();
+    }
+
+    #[test]
+    fn slow_mouse_report_does_not_leak_after_escape() {
+        let (_tx, input) = bounded(1);
+        let report = b"\x1b[<35;79;30M";
+        for child_mouse in [false, true] {
+            for split in 3..report.len() {
+                let mut mouse = CodexMouseUi::new(40, 100);
+                mouse.on_output(b"\x1b[?2004h");
+                if child_mouse {
+                    mouse.on_output(b"\x1b[?1003h\x1b[?1006h");
+                }
+                let mut c = Coordinator::new(Some(mouse), false, false);
+                c.on_input(ReadEvent::Data([b"\x1b\x1b", &report[..split]].concat()));
+                assert!(
+                    matches!(c.pending_child.take(), Some(InputCommand::Data(bytes)) if bytes == b"\x1b\x1b")
+                );
+                c.expire_input(Instant::now() + INPUT_SEQUENCE_TIMEOUT, &input);
+                assert!(c.pending_child.is_none());
+                c.on_input(ReadEvent::Data([&report[split..], b"hello"].concat()));
+                let expected = if child_mouse {
+                    [report.as_slice(), b"hello"].concat()
+                } else {
+                    b"hello".to_vec()
+                };
+                assert!(
+                    matches!(c.pending_child.take(), Some(InputCommand::Data(bytes)) if bytes == expected)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn queued_mouse_report_continuation_precedes_escape_timeout() {
+        for prefix_len in [1, 2] {
+            let report = b"\x1b[<35;79;30M";
+            let mut mouse = CodexMouseUi::new(40, 100);
+            mouse.on_output(b"\x1b[?2004h");
+            let mut c = Coordinator::new(Some(mouse), false, false);
+            c.on_input(ReadEvent::Data(report[..prefix_len].to_vec()));
+            c.input_deadline = Some(Instant::now() - INPUT_SEQUENCE_TIMEOUT);
+            let bytes = [&report[prefix_len..], b"hello"].concat();
+            let h = Harness::start_with_input(c, &bytes);
+            assert!(
+                matches!(h.child.recv_timeout(TIMEOUT).unwrap(), InputCommand::Data(bytes) if bytes == b"hello")
+            );
+            h.finish();
+        }
     }
 
     #[test]

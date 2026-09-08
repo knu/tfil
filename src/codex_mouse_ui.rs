@@ -15,6 +15,7 @@
 //! the encoding it asked for.
 
 use crate::filters::tmux_wrap;
+use std::borrow::Cow;
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 /// Enables SGR any-motion mouse reporting on the outer terminal.
@@ -30,6 +31,10 @@ const ARROW_UP: &[u8] = b"\x1b[A";
 const ARROW_DOWN: &[u8] = b"\x1b[B";
 const APP_ARROW_UP: &[u8] = b"\x1bOA";
 const APP_ARROW_DOWN: &[u8] = b"\x1bOB";
+const ALT_ESCAPE_CSI_U: &[u8] = b"\x1b[27;3u";
+const ALT_ESCAPE_XTERM: &[u8] = b"\x1b[27;3;27~";
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
 
 /// Codex enables bracketed paste when its interactive TUI starts.
 const INTERACTIVE_ENABLE: &[u8] = b"\x1b[?2004h";
@@ -56,6 +61,8 @@ pub struct CodexMouseUi {
     parser: vt100::Parser,
     state: InState,
     pending: Vec<u8>,
+    recover_mouse: bool,
+    pasting: bool,
     last_pos: Option<(u16, u16)>,
     pointer: bool,
     swallow_release: bool,
@@ -77,6 +84,8 @@ impl CodexMouseUi {
             parser: vt100::Parser::new(rows.max(1), cols.max(2), 0),
             state: InState::default(),
             pending: Vec::new(),
+            recover_mouse: false,
+            pasting: false,
             last_pos: None,
             pointer: false,
             swallow_release: false,
@@ -147,12 +156,14 @@ impl CodexMouseUi {
         (to_child, to_term)
     }
 
-    /// Reports whether an input sequence is waiting for more bytes.
-    pub fn has_pending_input(&self) -> bool {
-        !self.pending.is_empty()
+    /// Reports whether a prefix still needs a keyboard-input timeout.
+    /// Once SGR mouse framing is recognized, wait for the complete report
+    /// rather than leaking its bytes into the child's keyboard input.
+    pub fn needs_input_timeout(&self) -> bool {
+        matches!(self.state, InState::Esc | InState::Csi)
     }
 
-    /// Flushes any partially buffered input sequence on timeout or stdin EOF.
+    /// Flushes buffered input on an ambiguous-prefix timeout or stdin EOF.
     pub fn finish_input(&mut self) -> Vec<u8> {
         self.state = InState::Normal;
         std::mem::take(&mut self.pending)
@@ -161,9 +172,13 @@ impl CodexMouseUi {
     fn step(&mut self, byte: u8, to_child: &mut Vec<u8>, to_term: &mut Vec<u8>) {
         match self.state {
             InState::Normal => {
+                let recover_mouse = std::mem::take(&mut self.recover_mouse);
                 if byte == 0x1B {
                     self.pending.push(byte);
                     self.state = InState::Esc;
+                } else if recover_mouse && byte == b'[' {
+                    self.pending.push(byte);
+                    self.state = InState::Csi;
                 } else {
                     to_child.push(byte);
                 }
@@ -177,11 +192,30 @@ impl CodexMouseUi {
                 }
             }
             InState::Csi => {
-                if byte == b'<' {
+                if byte == b'<'
+                    && !self.pasting
+                    && matches!(self.pending.as_slice(), b"\x1b[" | b"[")
+                {
                     self.pending.push(byte);
                     self.state = InState::Mouse;
                 } else {
-                    self.abort(byte, to_child);
+                    self.pending.push(byte);
+                    let sequences = [ALT_ESCAPE_CSI_U, ALT_ESCAPE_XTERM, PASTE_START, PASTE_END];
+                    if sequences.contains(&self.pending.as_slice()) {
+                        if self.pending == PASTE_START {
+                            self.pasting = true;
+                        } else if self.pending == PASTE_END {
+                            self.pasting = false;
+                        } else if !self.pasting {
+                            // tmux can combine Escape and a mouse report's
+                            // leading ESC into Alt+Escape, leaving a bare [<.
+                            self.recover_mouse = true;
+                        }
+                        self.abort_flush(to_child);
+                    } else if !sequences.iter().any(|seq| seq.starts_with(&self.pending)) {
+                        self.pending.pop();
+                        self.abort(byte, to_child);
+                    }
                 }
             }
             InState::Mouse => {
@@ -194,8 +228,13 @@ impl CodexMouseUi {
                     self.pending.push(byte);
                     let seq = std::mem::take(&mut self.pending);
                     self.state = InState::Normal;
-                    match parse_sgr_mouse(&seq) {
-                        Some(ev) => self.handle_event(&ev, &seq, to_child, to_term),
+                    let report = if seq.starts_with(b"[<") {
+                        Cow::Owned([b"\x1b", seq.as_slice()].concat())
+                    } else {
+                        Cow::Borrowed(seq.as_slice())
+                    };
+                    match parse_sgr_mouse(&report) {
+                        Some(ev) => self.handle_event(&ev, &report, to_child, to_term),
                         None => to_child.extend_from_slice(&seq),
                     }
                 } else {
@@ -820,6 +859,74 @@ mod tests {
         assert_eq!(to_child, b"");
         let (to_child, _) = m.on_input(b);
         assert_eq!(to_child, b"\x1b[B\x1b[B\r");
+    }
+
+    #[test]
+    fn mouse_report_after_encoded_alt_escape_is_recovered_at_every_split() {
+        let events = [
+            (0, false),  // left press
+            (0, true),   // left release
+            (1, false),  // middle press
+            (2, false),  // right press
+            (32, false), // left drag
+            (35, false), // hover
+            (64, false), // wheel up
+            (65, false), // wheel down
+            (66, false), // wheel left
+            (67, false), // wheel right
+            (28, false), // Shift+Alt+Ctrl left press
+            (51, false), // Ctrl hover
+        ];
+        for prefix in [ALT_ESCAPE_CSI_U, ALT_ESCAPE_XTERM] {
+            for child_mouse in [false, true] {
+                for (code, release) in events {
+                    let report = sgr(code, 78, 29, release);
+                    let input = [prefix, &report[1..], b"\x1b[Ahello"].concat();
+                    for split in 0..=input.len() {
+                        let mut m = CodexMouseUi::new(40, 100);
+                        m.on_output(INTERACTIVE_ENABLE);
+                        if child_mouse {
+                            m.on_output(MOUSE_ENABLE);
+                        }
+                        let mut output = m.on_input(&input[..split]).0;
+                        output.extend(m.on_input(&input[split..]).0);
+                        output.extend(m.finish_input());
+                        let expected_report = if child_mouse { report.as_slice() } else { b"" };
+                        assert_eq!(output, [prefix, expected_report, b"\x1b[Ahello"].concat());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_recovery_preserves_text_and_bracketed_paste() {
+        let report = b"[<35;79;30M";
+        for input in [
+            report.to_vec(),
+            [ALT_ESCAPE_CSI_U, b"hello", report].concat(),
+            [ALT_ESCAPE_CSI_U, b"[<35;bad;30M"].concat(),
+            [ALT_ESCAPE_CSI_U, b"[<35;79;999999M"].concat(),
+            [ALT_ESCAPE_CSI_U, b"[not a report"].concat(),
+            [
+                PASTE_START,
+                ALT_ESCAPE_CSI_U,
+                report,
+                b"\x1b",
+                report,
+                PASTE_END,
+            ]
+            .concat(),
+        ] {
+            let mut m = menu();
+            let mut output = Vec::new();
+            for byte in &input {
+                output.extend(m.on_input(std::slice::from_ref(byte)).0);
+            }
+            output.extend(m.finish_input());
+            assert_eq!(output, input);
+            assert!(!m.pasting);
+        }
     }
 
     #[test]
