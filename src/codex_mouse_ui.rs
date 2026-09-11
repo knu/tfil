@@ -1,4 +1,4 @@
-//! Mouse support for Codex CLI's marker-based numbered menus.
+//! Mouse support for Codex CLI's numbered menus and queued questions.
 //!
 //! [`CodexMouseUi`] sits on both sides of the PTY proxy.  On the output
 //! side it waits for Codex to enter its interactive bracketed-paste
@@ -9,6 +9,7 @@
 //! own selection there with arrow keys (so the marker follows the
 //! mouse) and switches the terminal's mouse pointer shape via OSC 22;
 //! a click sends Enter to confirm the selection.
+//! Collapsed queued questions with a Shift+Left hint can be clicked to open.
 //!
 //! Events the menu logic does not consume are forwarded to the child
 //! only when the child has requested a mouse protocol of its own, in
@@ -29,6 +30,7 @@ pub const POINTER_OFF: &[u8] = b"\x1b]22;default\x1b\\";
 
 const ARROW_UP: &[u8] = b"\x1b[A";
 const ARROW_DOWN: &[u8] = b"\x1b[B";
+const SHIFT_ARROW_LEFT: &[u8] = b"\x1b[1;2D";
 const APP_ARROW_UP: &[u8] = b"\x1bOA";
 const APP_ARROW_DOWN: &[u8] = b"\x1bOB";
 const ALT_ESCAPE_CSI_U: &[u8] = b"\x1b[27;3u";
@@ -266,11 +268,24 @@ impl CodexMouseUi {
     ) {
         self.last_pos = Some((ev.row, ev.col));
         let lookup = self.menu_lookup(ev.row);
-        self.set_pointer(lookup.is_some(), to_term);
+        let question = self.is_queued_question(ev.row);
+        self.set_pointer(lookup.is_some() || question, to_term);
 
         let is_wheel = ev.code & 64 != 0;
         let is_motion = ev.code & 32 != 0 && !is_wheel;
         let button = ev.code & 3;
+
+        if question && !ev.release {
+            if is_motion && button == 3 {
+                return;
+            }
+            if ev.code == 0 {
+                to_child.extend_from_slice(SHIFT_ARROW_LEFT);
+                self.steered_row = None;
+                self.swallow_release = true;
+                return;
+            }
+        }
 
         // Hover: steer the child's own selection to the hovered option.
         if is_motion
@@ -336,7 +351,7 @@ impl CodexMouseUi {
         let Some((row, _)) = self.last_pos else {
             return;
         };
-        let clickable = self.menu_lookup(row).is_some();
+        let clickable = self.menu_lookup(row).is_some() || self.is_queued_question(row);
         self.set_pointer(clickable, out);
     }
 
@@ -379,6 +394,13 @@ impl CodexMouseUi {
         let (_, cols) = screen.size();
         let rows: Vec<String> = screen.rows(0, cols).collect();
         menu_lookup_in(&rows, usize::from(row))
+    }
+
+    fn is_queued_question(&self, row: u16) -> bool {
+        let screen = self.parser.screen();
+        let (_, cols) = screen.size();
+        let rows: Vec<String> = screen.rows(0, cols).collect();
+        is_queued_question_in(&rows, usize::from(row))
     }
 
     /// Reports whether `chunk` (or its boundary with the previous
@@ -486,8 +508,47 @@ fn parse_option_line(line: &str) -> Option<bool> {
 /// option line nor blank.
 fn is_continuation(line: &str) -> bool {
     parse_option_line(line).is_none()
-        && !line.trim().is_empty()
+        && line.chars().any(|c| {
+            !c.is_whitespace() && !matches!(c, '⠁' | '⠂' | '⠄' | '⠈' | '⠐' | '⠠' | '⡀' | '⢀')
+        })
         && line.chars().take_while(|&c| c == ' ').count() >= 3
+}
+
+/// Require the collapsed question's surrounding UI and displayed binding so
+/// ordinary question text cannot trigger a keyboard shortcut.
+fn is_queued_question_in(rows: &[String], row: usize) -> bool {
+    let Some(line) = rows.get(row) else {
+        return false;
+    };
+    let Some(summary) = line.strip_prefix("  ? ") else {
+        return false;
+    };
+    let fields: Vec<&str> = summary.split_whitespace().collect();
+    let (count, noun, countdown) = match fields.as_slice() {
+        [count, noun] => (*count, *noun, None),
+        [count, noun, seconds] | [count, noun, "·", seconds] => (*count, *noun, Some(*seconds)),
+        _ => return false,
+    };
+    if countdown.is_some_and(|seconds| {
+        seconds
+            .strip_suffix('s')
+            .is_none_or(|digits| digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()))
+    }) {
+        return false;
+    }
+    let valid_count = !count.is_empty()
+        && count.bytes().all(|b| b.is_ascii_digit())
+        && count.bytes().any(|b| b != b'0');
+    valid_count
+        && matches!(noun, "question" | "questions")
+        && rows
+            .get(row + 1)
+            .is_some_and(|hint| hint.trim() == "shift + ← to answer")
+        && rows[..row]
+            .iter()
+            .rev()
+            .take_while(|line| !line.trim().is_empty())
+            .any(|line| line.trim() == "• Queued follow-up inputs")
 }
 
 /// An active menu located around a clicked or hovered row.
@@ -601,6 +662,93 @@ mod tests {
             if release { 'm' } else { 'M' }
         )
         .into_bytes()
+    }
+
+    const QUEUED_QUESTION: &str = concat!(
+        "• Working (12s • esc to interrupt)\r\n",
+        "\r\n",
+        "• Queued follow-up inputs\r\n",
+        "  ? 1 question\r\n",
+        "    shift + ← to answer\r\n",
+        "          ⠁       ⠁          ⠐    ⡀⠐  ⠄\r\n",
+        "› Ask Codex to do anything   ⠈       ⠂\r\n",
+    );
+
+    #[test]
+    fn queued_question_hover_and_click_open_without_enter() {
+        for summary in [
+            "1 question",
+            "2 questions",
+            "1 question · 10s",
+            "1 question 1s",
+            "2 questions 0s",
+        ] {
+            let mut m = CodexMouseUi::new(24, 100);
+            m.on_output(INTERACTIVE_ENABLE);
+            m.on_output(QUEUED_QUESTION.replace("1 question", summary).as_bytes());
+            m.on_output(MOUSE_ENABLE);
+            assert_eq!(
+                m.on_input(&sgr(35, 5, 3, false)),
+                (vec![], POINTER_ON.to_vec())
+            );
+            assert_eq!(m.on_input(&sgr(0, 5, 3, false)).0, SHIFT_ARROW_LEFT);
+            // Redraw can replace the summary before the button is released.
+            assert_eq!(m.on_output(b"\x1b[2J"), POINTER_OFF);
+            assert!(m.on_input(&sgr(0, 5, 3, true)).0.is_empty());
+        }
+    }
+
+    #[test]
+    fn queued_question_requires_summary_header_and_binding() {
+        for output in [
+            QUEUED_QUESTION.replace("1 question", "0 questions"),
+            QUEUED_QUESTION.replace("1 question", "a question"),
+            QUEUED_QUESTION.replace("1 question", "1 question about code"),
+            QUEUED_QUESTION.replace("1 question", "1 question · notes"),
+            QUEUED_QUESTION.replace("1 question", "1 question s"),
+            QUEUED_QUESTION.replace("Queued follow-up inputs", "An ordinary heading"),
+            QUEUED_QUESTION.replace("shift + ←", "ctrl + ←"),
+        ] {
+            let mut m = CodexMouseUi::new(24, 100);
+            m.on_output(INTERACTIVE_ENABLE);
+            m.on_output(output.as_bytes());
+            assert_eq!(m.on_input(&sgr(35, 5, 3, false)), (vec![], vec![]));
+            assert!(m.on_input(&sgr(0, 5, 3, false)).0.is_empty());
+        }
+    }
+
+    #[test]
+    fn queued_question_preserves_other_mouse_events() {
+        let mut m = CodexMouseUi::new(24, 100);
+        m.on_output(INTERACTIVE_ENABLE);
+        m.on_output(QUEUED_QUESTION.as_bytes());
+        m.on_output(MOUSE_ENABLE);
+        for code in [1, 2, 4, 8, 16, 32, 64, 65] {
+            let event = sgr(code, 5, 3, false);
+            assert_eq!(m.on_input(&event).0, event);
+        }
+        for row in [2, 4, 5, 6] {
+            let event = sgr(0, 5, row, false);
+            assert_eq!(m.on_input(&event), (event.clone(), POINTER_OFF.to_vec()));
+            m.on_input(&sgr(35, 5, 3, false));
+        }
+    }
+
+    #[test]
+    fn sparkle_rows_are_not_menu_continuations() {
+        let mut m = CodexMouseUi::new(24, 100);
+        m.on_output(INTERACTIVE_ENABLE);
+        m.on_output(
+            "› 1. First\r\n  2. Second\r\n    ⠁ ⠂ ⠄ ⠈ ⠐ ⠠ ⡀ ⢀\r\n› Ask Codex\r\n".as_bytes(),
+        );
+        assert_eq!(m.on_input(&sgr(35, 5, 1, false)).0, ARROW_DOWN);
+        assert_eq!(
+            m.on_input(&sgr(35, 5, 2, false)),
+            (vec![], POINTER_OFF.to_vec())
+        );
+        assert!(m.on_input(&sgr(0, 5, 2, false)).0.is_empty());
+        assert!(is_continuation("    A real wrapped option ⠁"));
+        assert!(is_continuation("    ⠃⠗⠇"));
     }
 
     fn menu_moves_in(rows: &[String], clicked: usize) -> Option<i32> {
