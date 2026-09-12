@@ -1,4 +1,4 @@
-//! Mouse support for Codex CLI's numbered menus and queued questions.
+//! Mouse support for Codex CLI's menus, worktree list, and queued questions.
 //!
 //! [`CodexMouseUi`] sits on both sides of the PTY proxy.  On the output
 //! side it waits for Codex to enter its interactive bracketed-paste
@@ -10,6 +10,7 @@
 //! mouse) and switches the terminal's mouse pointer shape via OSC 22;
 //! a click sends Enter to confirm the selection.
 //! Collapsed queued questions with a Shift+Left hint can be clicked to open.
+//! The searchable Managed worktrees list also supports hover and click.
 //!
 //! Events the menu logic does not consume are forwarded to the child
 //! only when the child has requested a mouse protocol of its own, in
@@ -393,7 +394,8 @@ impl CodexMouseUi {
         let screen = self.parser.screen();
         let (_, cols) = screen.size();
         let rows: Vec<String> = screen.rows(0, cols).collect();
-        menu_lookup_in(&rows, usize::from(row))
+        worktree_lookup_in(&rows, usize::from(row))
+            .or_else(|| menu_lookup_in(&rows, usize::from(row)))
     }
 
     fn is_queued_question(&self, row: u16) -> bool {
@@ -562,6 +564,58 @@ struct MenuLookup {
     clicked_idx: usize,
 }
 
+/// Restrict unnumbered rows to the worktree browser's list, bounded by its
+/// header and footer.  The search field is separated from the list by a blank
+/// row.  Ambiguous or wrapped layouts are left to keyboard navigation.
+fn worktree_lookup_in(rows: &[String], clicked: usize) -> Option<MenuLookup> {
+    let header = rows[..clicked.min(rows.len())]
+        .iter()
+        .rposition(|line| line.trim() == "Managed worktrees")?;
+    let subtitle = rows.get(header + 1)?.trim();
+    if !matches!(
+        subtitle,
+        "Select a worktree to resume its owner or copy its working directory"
+            | "Select a worktree to resume, copy its path, or delete it"
+    ) {
+        return None;
+    }
+    let footer = header
+        + rows[header..]
+            .iter()
+            .position(|line| line.trim() == "Press enter to confirm or esc to go back")?;
+    let end = rows[..footer]
+        .iter()
+        .rposition(|line| !line.trim().is_empty())?
+        + 1;
+    let start = rows[..end]
+        .iter()
+        .rposition(|line| line.trim().is_empty())?
+        + 1;
+    if start <= header + 2 || !(start..end).contains(&clicked) {
+        return None;
+    }
+    let mut marked = None;
+    for (index, line) in rows[start..end].iter().enumerate() {
+        let text = if let Some(text) = line.strip_prefix("› ").or_else(|| line.strip_prefix("❯ "))
+        {
+            if marked.replace(index).is_some() {
+                return None;
+            }
+            text
+        } else {
+            line.strip_prefix("  ")?
+        };
+        if text.is_empty() || text.starts_with(char::is_whitespace) {
+            return None;
+        }
+    }
+    Some(MenuLookup {
+        options: (start..end).collect(),
+        marked_idx: marked?,
+        clicked_idx: clicked - start,
+    })
+}
+
 /// Locates the menu around the clicked row.  `None` when the click is
 /// not on an active menu: the block must contain at least two numbered
 /// options with exactly one selection marker.
@@ -651,6 +705,77 @@ mod tests {
         m.on_output(INTERACTIVE_ENABLE);
         m.on_output(CODEX_MENU.as_bytes());
         m
+    }
+
+    const WORKTREES: &str = concat!(
+        "  Managed worktrees\r\n",
+        "  Select a worktree to resume its owner or copy its working directory\r\n",
+        "\r\n",
+        "\r\n",
+        "› /repo/first  Owner: first\r\n",
+        "  /repo/second  Owner: second\r\n",
+        "\r\n",
+        "  Press enter to confirm or esc to go back\r\n",
+    );
+
+    #[test]
+    fn worktree_hover_and_click_use_existing_selection_tracking() {
+        let mut m = CodexMouseUi::new(24, 100);
+        m.on_output(INTERACTIVE_ENABLE);
+        m.on_output(WORKTREES.as_bytes());
+        assert_eq!(
+            m.on_input(&sgr(35, 10, 5, false)),
+            (ARROW_DOWN.to_vec(), POINTER_ON.to_vec())
+        );
+        assert_eq!(m.on_input(&sgr(0, 10, 5, false)).0, b"\r");
+        assert!(m.on_input(&sgr(0, 10, 5, true)).0.is_empty());
+        assert!(m.on_input(&sgr(0, 10, 7, false)).0.is_empty());
+    }
+
+    #[test]
+    fn worktree_list_supports_single_filtered_and_named_entries() {
+        for display in [
+            WORKTREES.replace("  /repo/second  Owner: second\r\n", ""),
+            WORKTREES.replace("\r\n\r\n\r\n", "\r\n  first\r\n\r\n"),
+            WORKTREES
+                .replace(
+                    "Select a worktree to resume its owner or copy its working directory",
+                    "Select a worktree to resume, copy its path, or delete it",
+                )
+                .replace(
+                    "/repo/first  Owner: first",
+                    "Fix login  updated 2h ago · /repo/first",
+                )
+                .replace(
+                    "/repo/second  Owner: second",
+                    "日本語の修正  updated 1h ago · /repo/second",
+                ),
+        ] {
+            let mut m = CodexMouseUi::new(24, 100);
+            m.on_output(INTERACTIVE_ENABLE);
+            m.on_output(display.as_bytes());
+            assert_eq!(m.on_input(&sgr(0, 5, 4, false)).0, b"\r");
+        }
+    }
+
+    #[test]
+    fn worktree_detection_rejects_unrelated_and_ambiguous_rows() {
+        let rows: Vec<String> = WORKTREES.split("\r\n").map(str::to_string).collect();
+        for row in [0, 1, 2, 3, 6, 7, 8, 99] {
+            assert!(worktree_lookup_in(&rows, row).is_none());
+        }
+        for (row, replacement) in [
+            (0, "  Other list"),
+            (1, "  No worktrees in this repository's configured pool"),
+            (4, "  /repo/first"),
+            (5, "› /repo/second"),
+            (5, "    wrapped description"),
+            (7, "  Some ordinary text"),
+        ] {
+            let mut altered = rows.clone();
+            altered[row] = replacement.to_string();
+            assert!(worktree_lookup_in(&altered, 4).is_none());
+        }
     }
 
     fn sgr(code: u16, col: u16, row: u16, release: bool) -> Vec<u8> {

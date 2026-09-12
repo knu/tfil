@@ -47,6 +47,8 @@ With no behavior options, `tfil` is a transparent PTY proxy.  Options can be com
 
 Collapsed `? N question(s)` rows under `Queued follow-up inputs` also show a hand pointer.  When the displayed hint is `shift + ← to answer`, clicking the question row sends Shift+Left to open it.  Rows containing only Astra's star decoration are excluded from menu continuation detection.
 
+The `Managed worktrees` browser also supports hovering and clicking unnumbered entries, including a single search result.  Detection requires the browser's heading, description, and standard Enter/Escape hint to remain visible; wrapped or ambiguous layouts fall back to keyboard navigation.
+
 Mouse events the menu logic does not consume are forwarded only when the child has enabled a mouse protocol of its own, using the encoding requested by the child.
 
 ```console
