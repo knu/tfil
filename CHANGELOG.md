@@ -8,6 +8,13 @@ version bumps for fixes.  Once `1.0.0` ships, the project will revisit and
 likely adopt strict [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.2.9] - 2026-09-13
+
+### Added
+
+- Support queued Codex question clicks
+- Support Codex worktree list mouse selection
+
 ## [0.2.8] - 2026-09-08
 
 ### Fixed

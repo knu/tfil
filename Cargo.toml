@@ -1,6 +1,6 @@
 [package]
 name = "tfil"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2024"
 authors = ["Akinori Musha <knu@idaemons.org>"]
 default-run = "tfil"
@@ -13,6 +13,7 @@ categories = ["command-line-utilities"]
 
 [package.metadata.release]
 publish = false
+push = false
 pre-release-commit-message = "Bump version to {{version}}"
 tag-message = "Release version {{version}}"
 pre-release-hook = ["sh", "-c", "git-cliff --tag \"v$NEW_VERSION\" --output CHANGELOG.md"]
