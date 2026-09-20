@@ -15,9 +15,6 @@ jobs:
     name: Maintain aged dependencies
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    permissions:
-      contents: write
-      pull-requests: write
 
     steps:
       - name: Harden Runner
@@ -25,8 +22,18 @@ jobs:
         with:
           egress-policy: audit
 
+      - name: Create maintenance App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          client-id: Iv23liJerm0Y4hw0hV7f
+          private-key: ${{ secrets.LOCKFILE_MAINTENANCE_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
       - name: Update lockfile and create a pull request
         uses: knu/lockfile-maintenance-action@v1 # zizmor: ignore[unpinned-uses] -- Trial the moving v1 release series.
         with:
+          token: ${{ steps.app-token.outputs.token }}
           files: /Cargo.lock
           minimum-release-age: 3 days

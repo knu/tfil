@@ -6,7 +6,7 @@ queue_rules:
     merge_method: merge-batch
     queue_conditions:
       - base = main
-      - author ~= ^(dependabot|renovate)\[bot\]$
+      - author ~= ^(dependabot|renovate|lockfile-maintenance)\[bot\]$
       - -draft
       - -conflict
       - "#approved-reviews-by >= 1"
@@ -16,7 +16,7 @@ queue_rules:
 merge_protections_settings:
   auto_merge_conditions:
     - base = main
-    - author ~= ^(dependabot|renovate)\[bot\]$
+    - author ~= ^(dependabot|renovate|lockfile-maintenance)\[bot\]$
     - -draft
     - -conflict
     - "#approved-reviews-by >= 1"
