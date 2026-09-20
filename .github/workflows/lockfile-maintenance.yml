@@ -1,45 +1,32 @@
-name: Lockfile maintenance trial
+name: Lockfile maintenance
 
 on:
   workflow_dispatch:
+
+concurrency:
+  group: lockfile-maintenance
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
   update:
-    name: Update and test aged dependencies
+    name: Maintain aged dependencies
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
         with:
-          persist-credentials: false
+          egress-policy: audit
 
-      - name: Install Cargo for dependency resolution
-        run: rustup toolchain install nightly-2026-09-10 --profile minimal
-
-      - name: Update lockfile with a three-day minimum publish age
-        run: sh .github/scripts/update-lockfile.sh
-
-      - name: Show dependency changes
-        run: git diff -- Cargo.lock
-
-      - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal --component clippy
-
-      - name: Lint
-        run: cargo +stable clippy --locked --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo +stable test --locked
-
-      - name: Upload tested lockfile
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - name: Update lockfile and create a pull request
+        uses: knu/lockfile-maintenance-action@v1 # zizmor: ignore[unpinned-uses] -- Trial the moving v1 release series.
         with:
-          name: aged-cargo-lock
-          path: Cargo.lock
-          if-no-files-found: error
-          retention-days: 7
+          files: /Cargo.lock
+          minimum-release-age: 3 days
