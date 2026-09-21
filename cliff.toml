@@ -58,14 +58,15 @@ commit_parsers = [
 
   # Dependency-bot commits are skipped by author, with subject fallbacks for
   # manual cherry-picks or squash commits.
-  { field = "author.name", pattern = "(?i)(dependabot|renovate|mergify)(\\[bot\\])?$", skip = true },
-  { field = "author.email", pattern = "(?i)@(dependabot|renovate|mergify)\\b", skip = true },
-  { field = "author.email", pattern = "^[0-9]+\\+(dependabot|renovate|mergify)(\\[bot\\])?@", skip = true },
+  { field = "author.name", pattern = "(?i)(dependabot|renovate|mergify|lockfile-maintenance)(\\[bot\\])?$", skip = true },
+  { field = "author.email", pattern = "(?i)@(dependabot|renovate|mergify|lockfile-maintenance)\\b", skip = true },
+  { field = "author.email", pattern = "^[0-9]+\\+(dependabot|renovate|mergify|lockfile-maintenance)(\\[bot\\])?@", skip = true },
   { message = "^Bump\\b", skip = true },
   { message = "^Update dependency\\b", skip = true },
   { message = "^Update .* action to\\b", skip = true },
   { message = "^Update Rust crate\\b", skip = true },
-  { message = "^Lock file maintenance\\b", skip = true },
+  { message = '^Maintain lockfiles with a minimum release age( \(#\d+\))?(\n|$)', skip = true },
+  { message = '^Lock ?file maintenance( \(#\d+\))?(\n|$)', skip = true },
 
   # Conventional Commits: internal-only types.
   { message = "^(chore|ci|build|docs?|test|tests|style|refactor|perf|revert)(\\(.+?\\))?!?:", skip = true },

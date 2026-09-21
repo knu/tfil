@@ -1,6 +1,8 @@
 name: Lockfile maintenance
 
 on:
+  schedule:
+    - cron: "0 0 * * 5" # Friday at 09:00 JST.
   workflow_dispatch:
 
 concurrency:
