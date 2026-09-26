@@ -8,6 +8,14 @@ version bumps for fixes.  Once `1.0.0` ships, the project will revisit and
 likely adopt strict [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.3.0] - 2026-09-27
+
+### Fixed
+
+- Fix mouse compatibility with Codex 0.157
+- Prevent backward PATH lookup in wrappers
+- Fix wide-character resize crashes
+
 ## [0.2.9] - 2026-09-13
 
 ### Added
