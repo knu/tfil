@@ -9,7 +9,7 @@
 //! own selection there with arrow keys (so the marker follows the
 //! mouse) and switches the terminal's mouse pointer shape via OSC 22;
 //! a click sends Enter to confirm the selection.
-//! Collapsed queued questions with a Shift+Left hint can be clicked to open.
+//! Collapsed queued questions with a supported shortcut hint can be clicked to open.
 //! The searchable Managed worktrees list also supports hover and click.
 //!
 //! Events the menu logic does not consume are forwarded to the child
@@ -32,6 +32,7 @@ pub const POINTER_OFF: &[u8] = b"\x1b]22;default\x1b\\";
 const ARROW_UP: &[u8] = b"\x1b[A";
 const ARROW_DOWN: &[u8] = b"\x1b[B";
 const SHIFT_ARROW_LEFT: &[u8] = b"\x1b[1;2D";
+const ALT_ARROW_UP: &[u8] = b"\x1b[1;3A";
 const APP_ARROW_UP: &[u8] = b"\x1bOA";
 const APP_ARROW_DOWN: &[u8] = b"\x1bOB";
 const ALT_ESCAPE_CSI_U: &[u8] = b"\x1b[27;3u";
@@ -269,19 +270,35 @@ impl CodexMouseUi {
     ) {
         self.last_pos = Some((ev.row, ev.col));
         let lookup = self.menu_lookup(ev.row);
-        let question = self.is_queued_question(ev.row);
-        self.set_pointer(lookup.is_some() || question, to_term);
+        let question = self.queued_question_binding(ev.row);
+        self.set_pointer(lookup.is_some() || question.is_some(), to_term);
 
         let is_wheel = ev.code & 64 != 0;
         let is_motion = ev.code & 32 != 0 && !is_wheel;
         let button = ev.code & 3;
 
-        if question && !ev.release {
-            if is_motion && button == 3 {
+        // Keep a gesture with the handler that consumed its initial press,
+        // even when confirming the menu redraws the screen before release.
+        if button == 0 && !is_wheel {
+            if self.swallow_release && (ev.release || is_motion) {
+                if ev.release {
+                    self.swallow_release = false;
+                }
+                return;
+            }
+            if !ev.release && !is_motion {
+                self.swallow_release = false;
+            }
+        }
+
+        if let Some(binding) = question
+            && !ev.release
+        {
+            if ev.code == 35 {
                 return;
             }
             if ev.code == 0 {
-                to_child.extend_from_slice(SHIFT_ARROW_LEFT);
+                to_child.extend_from_slice(binding);
                 self.steered_row = None;
                 self.swallow_release = true;
                 return;
@@ -289,8 +306,7 @@ impl CodexMouseUi {
         }
 
         // Hover: steer the child's own selection to the hovered option.
-        if is_motion
-            && button == 3
+        if ev.code == 35
             && !ev.release
             && let Some(l) = &lookup
         {
@@ -321,12 +337,6 @@ impl CodexMouseUi {
             self.swallow_release = true;
             return;
         }
-        // Swallow the release paired with a click we consumed.
-        if ev.release && !is_wheel && !is_motion && button == 0 && self.swallow_release {
-            self.swallow_release = false;
-            return;
-        }
-
         let screen = self.parser.screen();
         let allowed = match screen.mouse_protocol_mode() {
             MouseProtocolMode::None => false,
@@ -352,7 +362,8 @@ impl CodexMouseUi {
         let Some((row, _)) = self.last_pos else {
             return;
         };
-        let clickable = self.menu_lookup(row).is_some() || self.is_queued_question(row);
+        let clickable =
+            self.menu_lookup(row).is_some() || self.queued_question_binding(row).is_some();
         self.set_pointer(clickable, out);
     }
 
@@ -398,11 +409,11 @@ impl CodexMouseUi {
             .or_else(|| menu_lookup_in(&rows, usize::from(row)))
     }
 
-    fn is_queued_question(&self, row: u16) -> bool {
+    fn queued_question_binding(&self, row: u16) -> Option<&'static [u8]> {
         let screen = self.parser.screen();
         let (_, cols) = screen.size();
         let rows: Vec<String> = screen.rows(0, cols).collect();
-        is_queued_question_in(&rows, usize::from(row))
+        queued_question_binding_in(&rows, usize::from(row))
     }
 
     /// Reports whether `chunk` (or its boundary with the previous
@@ -518,39 +529,37 @@ fn is_continuation(line: &str) -> bool {
 
 /// Require the collapsed question's surrounding UI and displayed binding so
 /// ordinary question text cannot trigger a keyboard shortcut.
-fn is_queued_question_in(rows: &[String], row: usize) -> bool {
-    let Some(line) = rows.get(row) else {
-        return false;
-    };
-    let Some(summary) = line.strip_prefix("  ? ") else {
-        return false;
+fn queued_question_binding_in(rows: &[String], row: usize) -> Option<&'static [u8]> {
+    let summary = rows.get(row)?.strip_prefix("  ? ")?;
+    let binding = match rows.get(row + 1)?.trim() {
+        "shift + ← to answer" | "shift+← to answer" => SHIFT_ARROW_LEFT,
+        "⌥+↑ to answer" | "alt+↑ to answer" => ALT_ARROW_UP,
+        _ => return None,
     };
     let fields: Vec<&str> = summary.split_whitespace().collect();
     let (count, noun, countdown) = match fields.as_slice() {
         [count, noun] => (*count, *noun, None),
         [count, noun, seconds] | [count, noun, "·", seconds] => (*count, *noun, Some(*seconds)),
-        _ => return false,
+        _ => return None,
     };
     if countdown.is_some_and(|seconds| {
         seconds
             .strip_suffix('s')
             .is_none_or(|digits| digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()))
     }) {
-        return false;
+        return None;
     }
     let valid_count = !count.is_empty()
         && count.bytes().all(|b| b.is_ascii_digit())
         && count.bytes().any(|b| b != b'0');
-    valid_count
+    (valid_count
         && matches!(noun, "question" | "questions")
-        && rows
-            .get(row + 1)
-            .is_some_and(|hint| hint.trim() == "shift + ← to answer")
         && rows[..row]
             .iter()
             .rev()
             .take_while(|line| !line.trim().is_empty())
-            .any(|line| line.trim() == "• Queued follow-up inputs")
+            .any(|line| line.trim() == "• Queued follow-up inputs"))
+    .then_some(binding)
 }
 
 /// An active menu located around a clicked or hovered row.
@@ -848,7 +857,7 @@ mod tests {
         m.on_output(INTERACTIVE_ENABLE);
         m.on_output(QUEUED_QUESTION.as_bytes());
         m.on_output(MOUSE_ENABLE);
-        for code in [1, 2, 4, 8, 16, 32, 64, 65] {
+        for code in [1, 2, 4, 8, 16, 32, 39, 43, 51, 64, 65] {
             let event = sgr(code, 5, 3, false);
             assert_eq!(m.on_input(&event).0, event);
         }
@@ -856,6 +865,102 @@ mod tests {
             let event = sgr(0, 5, row, false);
             assert_eq!(m.on_input(&event), (event.clone(), POINTER_OFF.to_vec()));
             m.on_input(&sgr(35, 5, 3, false));
+        }
+    }
+
+    #[test]
+    fn queued_question_uses_codex_0157_displayed_binding() {
+        for (hint, expected) in [
+            ("shift+←", SHIFT_ARROW_LEFT),
+            ("⌥+↑", b"\x1b[1;3A".as_slice()),
+            ("alt+↑", b"\x1b[1;3A".as_slice()),
+        ] {
+            let mut m = CodexMouseUi::new(24, 100);
+            m.on_output(INTERACTIVE_ENABLE);
+            m.on_output(MOUSE_ENABLE);
+            m.on_output(QUEUED_QUESTION.replace("shift + ←", hint).as_bytes());
+            assert_eq!(
+                m.on_input(&sgr(35, 5, 3, false)),
+                (vec![], POINTER_ON.to_vec()),
+                "{hint}"
+            );
+            assert_eq!(m.on_input(&sgr(0, 5, 3, false)).0, expected, "{hint}");
+            assert!(m.on_input(&sgr(0, 5, 3, true)).0.is_empty());
+        }
+    }
+
+    #[test]
+    fn native_modified_motion_over_menu_is_preserved() {
+        let mut m = menu();
+        m.on_output(MOUSE_ENABLE);
+        for modifier in [4, 8, 16] {
+            let event = sgr(35 | modifier, 10, 7, false);
+            assert_eq!(m.on_input(&event).0, event);
+        }
+    }
+
+    #[test]
+    fn consumed_menu_press_does_not_leak_drag_to_native_selection() {
+        let mut m = menu();
+        m.on_output(MOUSE_ENABLE);
+        assert_eq!(m.on_input(&sgr(0, 3, 4, false)).0, b"\r");
+        m.on_output(b"\x1b[2J");
+        assert!(m.on_input(&sgr(32, 20, 10, false)).0.is_empty());
+        assert!(m.on_input(&sgr(0, 20, 10, true)).0.is_empty());
+        for event in [
+            sgr(0, 3, 4, false),
+            sgr(32, 20, 10, false),
+            sgr(0, 20, 10, true),
+            sgr(2, 20, 10, false),
+            sgr(2, 20, 10, true),
+            sgr(64, 20, 10, false),
+            sgr(65, 20, 10, false),
+        ] {
+            assert_eq!(m.on_input(&event).0, event);
+        }
+    }
+
+    #[test]
+    fn new_native_press_recovers_from_missing_menu_release() {
+        let mut m = menu();
+        m.on_output(MOUSE_ENABLE);
+        m.on_input(&sgr(0, 3, 4, false));
+        m.on_output(b"\x1b[2J");
+        for event in [
+            sgr(0, 5, 5, false),
+            sgr(32, 10, 5, false),
+            sgr(0, 10, 5, true),
+        ] {
+            assert_eq!(m.on_input(&event).0, event);
+        }
+    }
+
+    #[test]
+    fn codex_0157_native_mouse_modes_preserve_selection_and_copy_events() {
+        // tui/alternate_screen.rs in rust-v0.157.1, including crossterm cleanup.
+        let enable = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1003h";
+        let disable = b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+        for split in 0..=enable.len() {
+            let mut m = menu();
+            m.on_output(&enable[..split]);
+            m.on_output(&enable[split..]);
+            for event in [
+                sgr(35, 5, 0, false),
+                sgr(0, 5, 0, false),
+                sgr(32, 10, 0, false),
+                sgr(0, 10, 0, true),
+                sgr(4, 10, 0, false),
+                sgr(4, 10, 0, true),
+                sgr(2, 10, 0, false),
+                sgr(2, 10, 0, true),
+                sgr(64, 10, 0, false),
+                sgr(65, 10, 0, false),
+            ] {
+                assert_eq!(m.on_input(&event).0, event, "split {split}");
+            }
+            m.on_output(disable);
+            assert!(m.on_input(&sgr(0, 5, 0, false)).0.is_empty());
+            assert_eq!(m.on_input(&sgr(0, 3, 4, false)).0, b"\r");
         }
     }
 
