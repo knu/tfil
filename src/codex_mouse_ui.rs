@@ -18,6 +18,7 @@
 
 use crate::filters::tmux_wrap;
 use std::borrow::Cow;
+use std::num::NonZeroU16;
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 /// Enables SGR any-motion mouse reporting on the outer terminal.
@@ -85,7 +86,11 @@ impl CodexMouseUi {
     /// Creates a handler for a terminal of the given size.
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
-            parser: vt100::Parser::new(rows.max(1), cols.max(2), 0),
+            parser: vt100::Parser::new(
+                NonZeroU16::new(rows.max(1)).unwrap(),
+                NonZeroU16::new(cols.max(2)).unwrap(),
+                0,
+            ),
             state: InState::default(),
             pending: Vec::new(),
             recover_mouse: false,
@@ -104,7 +109,10 @@ impl CodexMouseUi {
 
     /// Resizes the screen model (call on SIGWINCH).
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.parser.screen_mut().set_size(rows.max(1), cols.max(2));
+        self.parser.set_size(
+            NonZeroU16::new(rows.max(1)).unwrap(),
+            NonZeroU16::new(cols.max(2)).unwrap(),
+        );
     }
 
     /// Emits pointer-shape OSCs wrapped in a tmux DCS passthrough so
@@ -404,7 +412,7 @@ impl CodexMouseUi {
     fn menu_lookup(&self, row: u16) -> Option<MenuLookup> {
         let screen = self.parser.screen();
         let (_, cols) = screen.size();
-        let rows: Vec<String> = screen.rows(0, cols).collect();
+        let rows: Vec<String> = screen.rows(0, cols.get()).collect();
         worktree_lookup_in(&rows, usize::from(row))
             .or_else(|| menu_lookup_in(&rows, usize::from(row)))
     }
@@ -412,7 +420,7 @@ impl CodexMouseUi {
     fn queued_question_binding(&self, row: u16) -> Option<&'static [u8]> {
         let screen = self.parser.screen();
         let (_, cols) = screen.size();
-        let rows: Vec<String> = screen.rows(0, cols).collect();
+        let rows: Vec<String> = screen.rows(0, cols.get()).collect();
         queued_question_binding_in(&rows, usize::from(row))
     }
 
@@ -1338,12 +1346,84 @@ mod tests {
     }
 
     #[test]
+    fn height_resize_keeps_queued_question_clicks_on_visible_rows() {
+        for alternate in [false, true] {
+            let mut m = CodexMouseUi::new(8, 100);
+            m.on_output(INTERACTIVE_ENABLE);
+            if alternate {
+                m.on_output(b"\x1b[?1049h");
+            }
+            m.on_output(QUEUED_QUESTION.as_bytes());
+
+            // Shrinking scrolls two rows off the top to keep the cursor visible.
+            m.resize(6, 100);
+            assert_eq!(m.on_input(&sgr(0, 5, 1, false)).0, SHIFT_ARROW_LEFT);
+            m.on_input(&sgr(0, 5, 1, true));
+            assert!(m.queued_question_binding(3).is_none());
+
+            // Only the main screen restores missing scrollback as blank top rows.
+            m.resize(8, 100);
+            let (row, old_row) = if alternate { (1, 3) } else { (3, 1) };
+            assert_eq!(m.on_input(&sgr(0, 5, row, false)).0, SHIFT_ARROW_LEFT);
+            assert!(m.queued_question_binding(old_row).is_none());
+        }
+    }
+
+    #[test]
+    fn shrinking_through_wide_character_allows_erasing_edge() {
+        let mut m = CodexMouseUi::new(60, 180);
+        m.on_output("keep\x1b[1;53Hあ".as_bytes());
+        m.resize(60, 53);
+        m.on_output(b"\x1b[1;53H\x1b[K");
+
+        assert_eq!(m.parser.screen().contents(), "keep");
+        assert_eq!(
+            m.parser.screen().size(),
+            (60.try_into().unwrap(), 53.try_into().unwrap())
+        );
+    }
+
+    #[test]
+    fn resizing_preserves_complete_cells_and_parser_state() {
+        for (text, cols, expected) in [
+            ("abc", 3, "abc"),
+            ("aあ", 2, "a"),
+            ("aあ", 3, "aあ"),
+            ("abあ", 2, "ab"),
+            ("aあ", 10, "aあ"),
+        ] {
+            let mut m = CodexMouseUi::new(4, 8);
+            m.on_output(text.as_bytes());
+            // Leave an unfinished SGR sequence across the resize.
+            m.on_output(b"\x1b[3");
+            m.resize(4, cols);
+            m.on_output(b"1m");
+            assert_eq!(m.parser.screen().contents(), expected);
+            assert_eq!(m.parser.screen().fgcolor(), vt100::Color::Idx(1));
+        }
+    }
+
+    #[test]
+    fn shrinking_repairs_wide_cells_on_both_screens() {
+        let mut m = CodexMouseUi::new(4, 8);
+        m.on_output("main\x1b[2;4Hあ\x1b[?1049halt\x1b[2;4Hあ".as_bytes());
+        m.resize(4, 4);
+        m.on_output(b"\x1b[2;4H\x1b[K");
+        assert_eq!(m.parser.screen().contents(), "alt");
+        m.on_output(b"\x1b[?1049l\x1b[2;4H\x1b[K");
+        assert_eq!(m.parser.screen().contents(), "main");
+    }
+
+    #[test]
     fn one_column_resize_accepts_wide_characters() {
         let mut m = CodexMouseUi::new(24, 100);
         m.resize(24, 1);
         m.on_output("›".as_bytes());
 
-        assert_eq!(m.parser.screen().size(), (24, 2));
+        assert_eq!(
+            m.parser.screen().size(),
+            (24.try_into().unwrap(), 2.try_into().unwrap())
+        );
     }
 
     #[test]

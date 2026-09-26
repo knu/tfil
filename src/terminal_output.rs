@@ -222,7 +222,7 @@ mod tests {
         for chunk in [b"\x1b[?1004h\x1b[?20".as_slice(), b"26l"] {
             output.write_child(chunk, &mouse.on_output(chunk)).unwrap();
         }
-        let mut screen = vt100::Parser::new(24, 100, 0);
+        let mut screen = vt100::Parser::new(24.try_into().unwrap(), 100.try_into().unwrap(), 0);
         screen.process(&output.writer);
         assert_eq!(screen.screen().contents(), "");
         assert!(output.writer.windows(8).any(|b| b == b"\x1b[?2026l"));
@@ -392,7 +392,7 @@ mod tests {
             output.writer,
             [b"\x1b[?2026l".as_slice(), &pointer].concat()
         );
-        let mut screen = vt100::Parser::new(24, 100, 0);
+        let mut screen = vt100::Parser::new(24.try_into().unwrap(), 100.try_into().unwrap(), 0);
         screen.process(&output.writer);
         assert_eq!(screen.screen().contents(), "");
     }

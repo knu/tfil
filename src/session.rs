@@ -434,12 +434,43 @@ impl Coordinator {
         mut resize: impl FnMut() -> portable_pty::PtySize,
         mut abort: impl FnMut(),
     ) -> Result<()> {
+        match catch_unwind(AssertUnwindSafe(|| {
+            self.run_loop(&ports, stop, &mut resize, &mut abort)
+        })) {
+            Ok(result) => result,
+            Err(_) => {
+                // The stop sender was dropped during unwinding.  Do not use
+                // the possibly damaged UI model again; only restore modes.
+                abort();
+                if ports
+                    .terminal
+                    .send(TerminalCommand::Finish(self.cleanup()))
+                    .is_ok()
+                {
+                    while let Ok(notice) = ports.completed.recv() {
+                        if notice.worker == Worker::TerminalWriter {
+                            break;
+                        }
+                    }
+                }
+                Err(anyhow::anyhow!("session coordinator panicked"))
+            }
+        }
+    }
+
+    fn run_loop(
+        &mut self,
+        ports: &Ports,
+        stop: Sender<()>,
+        mut resize: impl FnMut() -> portable_pty::PtySize,
+        mut abort: impl FnMut(),
+    ) -> Result<()> {
         let mut stop = Some(stop);
         let mut resize_closed = false;
         let mut workers = Workers::default();
         loop {
             if let Some(result) = workers.take_result() {
-                return self.error.map_or(result, Err);
+                return self.error.take().map_or(result, Err);
             }
             self.prepare_commands(&mut stop);
             self.expire_input(Instant::now(), &ports.input);
@@ -803,6 +834,14 @@ mod tests {
         }
 
         fn start_with_input(coordinator: Coordinator, bytes: &[u8]) -> Self {
+            Self::start_with_events(coordinator, bytes, None)
+        }
+
+        fn start_with_events(
+            coordinator: Coordinator,
+            bytes: &[u8],
+            resize_fn: Option<fn() -> portable_pty::PtySize>,
+        ) -> Self {
             let (output, output_rx) = bounded(1);
             let (input, input_rx) = bounded(1);
             if !bytes.is_empty() {
@@ -814,6 +853,9 @@ mod tests {
             let (completed, completed_rx) = bounded(5);
             let (stop, stopped) = bounded(0);
             let (resize_tx, resize) = bounded(1);
+            if resize_fn.is_some() {
+                resize_tx.send(()).unwrap();
+            }
             drop(resize_tx);
             let (result_tx, result) = bounded(1);
             let (abort_tx, aborted) = bounded(1);
@@ -829,7 +871,7 @@ mod tests {
                 let result = coordinator.run(
                     ports,
                     stop,
-                    || unreachable!(),
+                    || resize_fn.unwrap()(),
                     || {
                         let _ = abort_tx.try_send(());
                     },
@@ -862,6 +904,43 @@ mod tests {
             assert!(self.result.try_recv().is_err());
             self.complete(Worker::TerminalWriter, Ok(()));
             self.result.recv_timeout(TIMEOUT).unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn coordinator_panic_aborts_and_restores_terminal_before_returning() {
+        for tmux_pointer in [false, true] {
+            let mut mouse = CodexMouseUi::new(60, 180);
+            mouse.on_output(b"\x1b[?2004h");
+            let h = Harness::start_with_events(
+                Coordinator::new(Some(mouse), true, tmux_pointer),
+                b"",
+                Some(|| panic!("resize failed")),
+            );
+            h.aborted.recv_timeout(TIMEOUT).unwrap();
+            assert!(matches!(
+                h.stopped.recv_timeout(TIMEOUT),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+            ));
+            let TerminalCommand::Finish(bytes) = h.terminal.recv_timeout(TIMEOUT).unwrap() else {
+                panic!("missing terminal cleanup");
+            };
+            let pointer = if tmux_pointer {
+                tmux_wrap(POINTER_OFF)
+            } else {
+                POINTER_OFF.to_vec()
+            };
+            assert_eq!(bytes, [MOUSE_DISABLE, &pointer, CURSOR_SHOW].concat());
+            assert!(h.result.try_recv().is_err());
+            h.complete(Worker::TerminalWriter, Ok(()));
+            assert_eq!(
+                h.result
+                    .recv_timeout(TIMEOUT)
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string(),
+                "session coordinator panicked"
+            );
         }
     }
 
