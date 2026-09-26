@@ -17,30 +17,34 @@ use std::path::{Path, PathBuf};
 const MARKER: &[u8] = b"#!/bin/sh\n# tfil-wrapper\n";
 
 /// Resolve the command a wrapper stands for: search PATH for an
-/// executable named after `self_path`'s basename, skipping the wrapper
+/// executable named after `self_path`'s basename, starting after the wrapper
 /// itself (compared by device/inode, so symlinked or renamed wrappers
-/// are still recognized) and any other tfil wrapper.
+/// are still recognized). Skip later aliases of self and other tfil wrappers.
+/// If the wrapper is absent from PATH, do not restart the search at the front.
 pub fn resolve_command(self_path: &Path) -> Result<PathBuf> {
     let name = self_path
         .file_name()
         .with_context(|| format!("--wrap={}: no file name", self_path.display()))?;
     resolve_in_path(&env::var_os("PATH").unwrap_or_default(), name, self_path).with_context(|| {
         format!(
-            "{}: not found in PATH (excluding wrappers)",
-            name.to_string_lossy()
+            "{}: not found in PATH after {} (excluding tfil wrappers)",
+            name.to_string_lossy(),
+            self_path.display()
         )
     })
 }
 
 fn resolve_in_path(path_var: &OsStr, name: &OsStr, self_path: &Path) -> Option<PathBuf> {
-    let self_id = file_id(self_path);
+    let self_id = file_id(self_path)?;
+    let mut after_self = false;
     env::split_paths(path_var).find_map(|dir| {
         let dir = nonempty_dir(dir);
         let cand = dir.join(name);
-        (is_executable_file(&cand)
-            && !(self_id.is_some() && file_id(&cand) == self_id)
-            && !is_tfil_wrapper(&cand))
-        .then_some(cand)
+        if file_id(&cand) == Some(self_id) {
+            after_self = true;
+            return None;
+        }
+        (after_self && is_executable_file(&cand) && !is_tfil_wrapper(&cand)).then_some(cand)
     })
 }
 
@@ -303,6 +307,38 @@ mod tests {
         let path_var = env::join_paths([&bin_a, &bin_b, &bin_c]).unwrap();
         let resolved = resolve_in_path(&path_var, OsStr::new("claude"), &self_path);
         assert_eq!(resolved.as_deref(), Some(real.as_path()));
+    }
+
+    #[test]
+    fn resolve_ignores_commands_before_self() {
+        let tmp = tempfile::tempdir().unwrap();
+        let before = tmp.path().join("before");
+        let wrapper = tmp.path().join("wrapper");
+        let after = tmp.path().join("after");
+        for dir in [&before, &wrapper, &after] {
+            fs::create_dir(dir).unwrap();
+            make_executable(&dir.join("codex"), "#!/bin/sh\nexit 0\n");
+        }
+        let path_var = env::join_paths([&before, &wrapper, &after]).unwrap();
+        assert_eq!(
+            resolve_in_path(&path_var, OsStr::new("codex"), &wrapper.join("codex")),
+            Some(after.join("codex")),
+        );
+    }
+
+    #[test]
+    fn resolve_requires_self_in_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = tmp.path().join("codex");
+        make_executable(&wrapper, "#!/bin/sh\nexit 0\n");
+        let real_dir = tmp.path().join("real");
+        fs::create_dir(&real_dir).unwrap();
+        make_executable(&real_dir.join("codex"), "#!/bin/sh\nexit 0\n");
+        let path_var = env::join_paths([&real_dir]).unwrap();
+        assert_eq!(
+            resolve_in_path(&path_var, OsStr::new("codex"), &wrapper),
+            None
+        );
     }
 
     #[test]
