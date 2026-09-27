@@ -63,13 +63,21 @@ To relay the OSC 22 pointer-shape updates through tmux, combine the mouse UI wit
 
 Some terminals manage the pointer shape themselves while mouse tracking is active, as tmux does with `mouse on`, and ignore OSC 22 in that state.
 
+### TCrit integration
+
+`--tcrit-notify` helps [TCrit](https://github.com/knu/tcrit), a terminal code review tool, locate Codex running in tmux or Herdr.  Codex's daemon mode, enabled by default since [0.157.0](https://github.com/openai/codex/releases/tag/rust-v0.157.0), can prevent TCrit from identifying the terminal directly.  tfil detects markers in Codex's output and notifies TCrit of the terminal to use for the review.
+
+```console
+% tfil --tcrit-notify codex
+```
+
 ### Wrapper scripts
 
 `--create-wrapper=PATH` writes a small shell script that runs the command named after its basename through `tfil` with the given options, instead of running a command.  The recommended setup for Claude Code and Codex CLI is:
 
 ```console
 % tfil --create-wrapper=~/bin/claude --strip-ink-fake-cursor
-% tfil --create-wrapper=~/bin/codex --codex-mouse-ui --tmux-osc-passthrough=22
+% tfil --create-wrapper=~/bin/codex --codex-mouse-ui --tmux-osc-passthrough=22 --tcrit-notify
 ```
 
 Typing `claude` or `codex` then transparently runs the real command under `tfil` with the recommended enhancements.  The option is repeatable, so brace expansion creates several wrappers with the same options at once:

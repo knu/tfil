@@ -13,6 +13,7 @@ use tfil::filters::{
 };
 
 mod session;
+mod tcrit_notify;
 mod terminal_output;
 mod wrapper;
 
@@ -42,6 +43,10 @@ struct Cli {
     /// and a pointer cursor is shown over options (OSC 22)
     #[arg(long)]
     codex_mouse_ui: bool,
+
+    /// Notify TCrit of visible terminal request markers using the launch environment
+    #[arg(long)]
+    tcrit_notify: bool,
 
     /// Wrap the given OSC sequences (comma-separated codes, e.g. "22"
     /// or "22,52") in a tmux DCS passthrough so they reach the outer
@@ -102,6 +107,9 @@ impl Cli {
         if self.codex_mouse_ui {
             args.push("--codex-mouse-ui".to_string());
         }
+        if self.tcrit_notify {
+            args.push("--tcrit-notify".to_string());
+        }
         if !self.tmux_osc_passthrough.is_empty() {
             let codes: Vec<String> = self
                 .tmux_osc_passthrough
@@ -141,6 +149,10 @@ fn main() -> ExitCode {
         };
     }
 
+    let notify = cli
+        .tcrit_notify
+        .then(tcrit_notify::Config::capture)
+        .flatten();
     let bypass_pty = should_bypass_pty(
         cli.wrap.is_some(),
         io::stdin().is_terminal(),
@@ -165,7 +177,7 @@ fn main() -> ExitCode {
         return ExitCode::from(126);
     }
 
-    match run(cli, program, args) {
+    match run(cli, program, args, notify) {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
             eprintln!("tfil: {:#}", e);
@@ -178,7 +190,12 @@ fn should_bypass_pty(wrap: bool, stdin_tty: bool, stdout_tty: bool) -> bool {
     wrap && (!stdin_tty || !stdout_tty)
 }
 
-fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
+fn run(
+    cli: Cli,
+    program: PathBuf,
+    args: Vec<String>,
+    notify: Option<tcrit_notify::Config>,
+) -> Result<i32> {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(current_pty_size())
@@ -241,6 +258,7 @@ fn run(cli: Cli, program: PathBuf, args: Vec<String>) -> Result<i32> {
             restore_cursor: cli.strip_ink_fake_cursor,
             tmux_pointer,
             dump: debug_dump.as_deref().and_then(open_dump_file),
+            notify,
         },
     )
 }
@@ -364,6 +382,7 @@ mod tests {
             "--strip-ink-fake-cursor",
             "--strip-osc-titles",
             "--codex-mouse-ui",
+            "--tcrit-notify",
             "--tmux-osc-passthrough=22,52",
             "--debug-dump=dump.log",
             "cmd",

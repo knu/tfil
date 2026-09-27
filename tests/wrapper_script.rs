@@ -32,6 +32,7 @@ fn generated_wrapper_bypasses_pty_for_non_terminal_io() {
     let wrapper = bin_dir.join("hello");
     let output = Command::new(tfil)
         .arg(format!("--create-wrapper={}", wrapper.display()))
+        .arg("--tcrit-notify")
         .env("PATH", &path_var)
         .stdin(Stdio::null())
         .output()
@@ -41,6 +42,9 @@ fn generated_wrapper_bypasses_pty_for_non_terminal_io() {
         "create failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let script = fs::read_to_string(&wrapper).unwrap();
+    assert!(script.contains("--tcrit-notify"));
+    assert!(!script.contains("--codex-mouse-ui"));
 
     // Piped standard I/O bypasses the PTY so newlines and the separation
     // between stdout and stderr remain intact.

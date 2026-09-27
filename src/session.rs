@@ -29,6 +29,7 @@ pub(crate) struct Options {
     pub restore_cursor: bool,
     pub tmux_pointer: bool,
     pub dump: Option<File>,
+    pub notify: Option<crate::tcrit_notify::Config>,
 }
 
 #[derive(Debug)]
@@ -109,7 +110,7 @@ pub(crate) fn run(
 
     // Without a UI model, data needs no coordination.  EOF still goes through
     // the coordinator, which appends closing commands to the same writer queues.
-    let direct_output = mouse.is_none().then(|| terminal_tx.clone());
+    let direct_output = (mouse.is_none() && options.notify.is_none()).then(|| terminal_tx.clone());
     let cancel = stop_rx.clone();
     spawn_worker(Worker::OutputReader, completed_tx.clone(), move || {
         read_output(
@@ -163,7 +164,12 @@ pub(crate) fn run(
         completed: completed_rx,
         resize: resize_rx,
     };
-    let result = Coordinator::new(mouse, options.restore_cursor, options.tmux_pointer).run(
+    let mut coordinator = Coordinator::new(mouse, options.restore_cursor, options.tmux_pointer);
+    if let Some(config) = options.notify {
+        let size = crate::current_pty_size();
+        coordinator.notify = crate::tcrit_notify::Observer::start(config, size.rows, size.cols);
+    }
+    let result = coordinator.run(
         ports,
         stop_tx,
         || {
@@ -261,6 +267,7 @@ impl Workers {
 
 struct Coordinator {
     mouse: Option<CodexMouseUi>,
+    notify: Option<crate::tcrit_notify::Observer>,
     restore_cursor: bool,
     tmux_pointer: bool,
     pending_terminal: Option<TerminalCommand>,
@@ -276,6 +283,7 @@ impl Coordinator {
     fn new(mouse: Option<CodexMouseUi>, restore_cursor: bool, tmux_pointer: bool) -> Self {
         Self {
             mouse,
+            notify: None,
             restore_cursor,
             tmux_pointer,
             pending_terminal: None,
@@ -307,6 +315,9 @@ impl Coordinator {
     fn on_output(&mut self, event: ReadEvent) {
         match event {
             ReadEvent::Data(bytes) => {
+                if let Some(notify) = &mut self.notify {
+                    notify.observe(&bytes);
+                }
                 let extra = self
                     .mouse
                     .as_mut()
@@ -554,6 +565,9 @@ impl Coordinator {
                     let size = resize();
                     if let Some(mouse) = &mut self.mouse {
                         mouse.resize(size.rows, size.cols);
+                    }
+                    if let Some(notify) = &mut self.notify {
+                        notify.resize(size.rows, size.cols);
                     }
                 } else {
                     resize_closed = true;
