@@ -8,6 +8,12 @@ version bumps for fixes.  Once `1.0.0` ships, the project will revisit and
 likely adopt strict [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.4.0] - 2026-09-27
+
+### Added
+
+- Add TCrit terminal marker notifications.  TCrit users should regenerate their Codex wrapper with `--tcrit-notify`.
+
 ## [0.3.0] - 2026-09-27
 
 ### Fixed
@@ -125,4 +131,3 @@ likely adopt strict [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - Add initial tfil implementation
-
