@@ -26,7 +26,7 @@ jobs:
           egress-policy: audit
 
       - name: Update lockfile and create a pull request
-        uses: knu/lockfile-maintenance-action@b25f71652280135d0af3ed9abee56849942c5624 # v2.0.0
+        uses: knu/lockfile-maintenance-action@88c9463c4ac32a3b5d1a0ef2ce1caedab9bd80c3 # v2.1.0
         with:
           files: /Cargo.lock
           minimum-release-age: 3 days
