@@ -8,6 +8,12 @@ version bumps for fixes.  Once `1.0.0` ships, the project will revisit and
 likely adopt strict [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.4.2] - 2026-10-12
+
+### Fixed
+
+- Restore queued Codex question clicks when the shortcut hint uses the symbolic Shift+Left label `⇧←`.
+
 ## [0.4.1] - 2026-10-11
 
 ### Added
