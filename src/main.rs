@@ -12,8 +12,8 @@ use tfil::filters::{
     TmuxOscPassthroughFilter,
 };
 
+mod critty_notify;
 mod session;
-mod tcrit_notify;
 mod terminal_output;
 mod wrapper;
 
@@ -44,9 +44,10 @@ struct Cli {
     #[arg(long)]
     codex_mouse_ui: bool,
 
-    /// Notify TCrit of visible terminal request markers using the launch environment
-    #[arg(long)]
-    tcrit_notify: bool,
+    /// Notify Critty of visible terminal request markers using the launch
+    /// environment; also notifies TCrit of its older markers
+    #[arg(long, alias = "tcrit-notify")]
+    critty_notify: bool,
 
     /// Wrap the given OSC sequences (comma-separated codes, e.g. "22"
     /// or "22,52") in a tmux DCS passthrough so they reach the outer
@@ -107,8 +108,8 @@ impl Cli {
         if self.codex_mouse_ui {
             args.push("--codex-mouse-ui".to_string());
         }
-        if self.tcrit_notify {
-            args.push("--tcrit-notify".to_string());
+        if self.critty_notify {
+            args.push("--critty-notify".to_string());
         }
         if !self.tmux_osc_passthrough.is_empty() {
             let codes: Vec<String> = self
@@ -150,8 +151,8 @@ fn main() -> ExitCode {
     }
 
     let notify = cli
-        .tcrit_notify
-        .then(tcrit_notify::Config::capture)
+        .critty_notify
+        .then(critty_notify::Config::capture)
         .flatten();
     let bypass_pty = should_bypass_pty(
         cli.wrap.is_some(),
@@ -194,7 +195,7 @@ fn run(
     cli: Cli,
     program: PathBuf,
     args: Vec<String>,
-    notify: Option<tcrit_notify::Config>,
+    notify: Option<critty_notify::Config>,
 ) -> Result<i32> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -382,7 +383,7 @@ mod tests {
             "--strip-ink-fake-cursor",
             "--strip-osc-titles",
             "--codex-mouse-ui",
-            "--tcrit-notify",
+            "--critty-notify",
             "--tmux-osc-passthrough=22,52",
             "--debug-dump=dump.log",
             "cmd",

@@ -43,7 +43,7 @@ fn generated_wrapper_bypasses_pty_for_non_terminal_io() {
         String::from_utf8_lossy(&output.stderr)
     );
     let script = fs::read_to_string(&wrapper).unwrap();
-    assert!(script.contains("--tcrit-notify"));
+    assert!(script.contains("--critty-notify"));
     assert!(!script.contains("--codex-mouse-ui"));
 
     // Piped standard I/O bypasses the PTY so newlines and the separation

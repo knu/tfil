@@ -20,9 +20,21 @@ const SEEN_CAPACITY: usize = 256;
 const SEEN_TTL: Duration = Duration::from_secs(120);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const ID_LEN: usize = 32;
+
+/// Marker prefixes and the commands they notify.  TCrit was renamed Critty;
+/// its markers stay supported while older installations remain.
+const HELPERS: [(&str, &str); 2] = [("CRITTY-", "critty"), ("TCRIT-", "tcrit")];
+
+/// A request ID observed after the marker prefix of `HELPERS[helper]`.
+#[derive(Clone, Debug, PartialEq)]
+struct Marker {
+    helper: usize,
+    id: String,
+}
 
 pub(crate) struct Config {
-    program: PathBuf,
+    programs: [Option<PathBuf>; HELPERS.len()],
     environment: Vec<(OsString, OsString)>,
 }
 
@@ -30,36 +42,40 @@ impl Config {
     /// Capture before wrapper resolution or child startup can change context.
     pub(crate) fn capture() -> Option<Self> {
         let cwd = std::env::current_dir().ok()?;
-        let program = std::env::split_paths(&std::env::var_os("PATH")?).find_map(|dir| {
-            let path = cwd.join(dir).join("tcrit");
-            path.metadata()
-                .ok()
-                .filter(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)?;
-            Some(path)
-        })?;
-        Some(Self {
-            program,
+        let path = std::env::var_os("PATH")?;
+        let programs = HELPERS.map(|(_, name)| {
+            std::env::split_paths(&path).find_map(|dir| {
+                let program = cwd.join(dir).join(name);
+                program
+                    .metadata()
+                    .ok()
+                    .filter(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)?;
+                Some(program)
+            })
+        });
+        programs.iter().any(Option::is_some).then(|| Self {
+            programs,
             environment: std::env::vars_os().collect(),
         })
     }
 
-    fn command(&self, id: &str) -> Command {
-        let mut command = Command::new(&self.program);
+    fn command(&self, marker: &Marker) -> Option<Command> {
+        let mut command = Command::new(self.programs[marker.helper].as_ref()?);
         command
-            .args(["terminal", "notify", id])
+            .args(["terminal", "notify", &marker.id])
             .env_clear()
             .envs(self.environment.iter().cloned())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        command
+        Some(command)
     }
 }
 
 pub(crate) struct Observer {
     parser: vt100::Parser,
-    seen: VecDeque<(String, Instant)>,
-    sender: Option<Sender<String>>,
+    seen: VecDeque<(Marker, Instant)>,
+    sender: Option<Sender<Marker>>,
     stopping: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -70,7 +86,7 @@ impl Observer {
         let stopping = Arc::new(AtomicBool::new(false));
         let stop = stopping.clone();
         let worker = thread::Builder::new()
-            .name("tcrit-notify".into())
+            .name("critty-notify".into())
             .spawn(move || notify(config, receiver, stop))
             .ok()?;
         Some(Self {
@@ -97,18 +113,18 @@ impl Observer {
         {
             self.seen.pop_front();
         }
-        for id in visible_ids(self.parser.screen()) {
-            if self.seen.iter().any(|(seen, _)| seen == &id) {
+        for marker in visible_markers(self.parser.screen()) {
+            if self.seen.iter().any(|(seen, _)| seen == &marker) {
                 continue;
             }
             if self.seen.len() == SEEN_CAPACITY {
                 self.seen.pop_front();
             }
-            self.seen.push_back((id.clone(), now));
+            self.seen.push_back((marker.clone(), now));
             // Remember dropped attempts too: a full queue must not cause a
             // redraw to retry indefinitely.
             if let Some(sender) = &self.sender {
-                let _ = sender.try_send(id);
+                let _ = sender.try_send(marker);
             }
         }
     }
@@ -128,61 +144,65 @@ fn size(value: u16, minimum: u16) -> NonZeroU16 {
     NonZeroU16::new(value.max(minimum)).unwrap()
 }
 
-fn visible_ids(screen: &vt100::Screen) -> Vec<String> {
+fn visible_markers(screen: &vt100::Screen) -> Vec<Marker> {
     let (rows, cols) = screen.size();
-    let mut ids = Vec::new();
+    let mut markers = Vec::new();
     // Use cells, not contents(): contents joins soft-wrapped rows and loses
     // the coordinates needed to distinguish an unfinished token at the cursor.
     for row in 0..rows.get() {
-        for col in 0..cols.get().saturating_sub(37) {
-            let matches = b"TCRIT-".iter().enumerate().all(|(i, byte)| {
-                screen
-                    .cell(row, col + i as u16)
-                    .is_some_and(|c| c.contents().as_bytes() == [*byte])
-            });
-            if !matches {
-                continue;
-            }
-            let mut id = String::with_capacity(32);
-            for offset in 6..38 {
-                let contents = screen.cell(row, col + offset).unwrap().contents();
-                if contents.len() != 1
-                    || !matches!(contents.as_bytes()[0], b'0'..=b'9' | b'a'..=b'f')
-                {
-                    break;
+        for col in 0..cols.get() {
+            for (helper, (prefix, _)) in HELPERS.iter().enumerate() {
+                if let Some(id) = marker_id(screen, row, col, prefix) {
+                    markers.push(Marker { helper, id });
                 }
-                id.push_str(contents);
             }
-            if id.len() != 32 {
-                continue;
-            }
-            let end = col + 38;
-            // A token at the right edge might continue on the next row.  Stay
-            // conservative on narrow terminals rather than stitch rows.
-            if end >= cols.get() {
-                continue;
-            }
-            let next = screen.cell(row, end).unwrap().contents();
-            if next.as_bytes().first().is_some_and(u8::is_ascii_hexdigit) {
-                continue;
-            }
-            // A read boundary is not a token boundary.  Wait for a delimiter
-            // or for the cursor to leave, even if a blank cell follows the ID.
-            if next.is_empty() && screen.cursor_position() == (row, end) {
-                continue;
-            }
-            ids.push(id);
         }
     }
-    ids
+    markers
 }
 
-fn notify(config: Config, receiver: Receiver<String>, stopping: Arc<AtomicBool>) {
-    while let Ok(id) = receiver.recv() {
+/// Return the request ID of a complete marker starting at the given cell.
+fn marker_id(screen: &vt100::Screen, row: u16, col: u16, prefix: &str) -> Option<String> {
+    let end = col + (prefix.len() + ID_LEN) as u16;
+    // A token at the right edge might continue on the next row.  Stay
+    // conservative on narrow terminals rather than stitch rows.
+    if end >= screen.size().1.get() {
+        return None;
+    }
+    let cell = |offset: usize| screen.cell(row, col + offset as u16).unwrap().contents();
+    if !prefix
+        .bytes()
+        .enumerate()
+        .all(|(i, byte)| cell(i).as_bytes() == [byte])
+    {
+        return None;
+    }
+    let mut id = String::with_capacity(ID_LEN);
+    for offset in prefix.len()..prefix.len() + ID_LEN {
+        let contents = cell(offset);
+        if contents.len() != 1 || !matches!(contents.as_bytes()[0], b'0'..=b'9' | b'a'..=b'f') {
+            return None;
+        }
+        id.push_str(contents);
+    }
+    let next = screen.cell(row, end).unwrap().contents();
+    if next.as_bytes().first().is_some_and(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    // A read boundary is not a token boundary.  Wait for a delimiter
+    // or for the cursor to leave, even if a blank cell follows the ID.
+    if next.is_empty() && screen.cursor_position() == (row, end) {
+        return None;
+    }
+    Some(id)
+}
+
+fn notify(config: Config, receiver: Receiver<Marker>, stopping: Arc<AtomicBool>) {
+    while let Ok(marker) = receiver.recv() {
         if stopping.load(Ordering::Relaxed) {
             break;
         }
-        let Ok(mut child) = config.command(&id).spawn() else {
+        let Some(Ok(mut child)) = config.command(&marker).map(|mut c| c.spawn()) else {
             continue;
         };
         let deadline = Instant::now() + COMMAND_TIMEOUT;
@@ -208,7 +228,14 @@ mod tests {
 
     const ID: &str = "0123456789abcdef0123456789abcdef";
 
-    fn detector() -> (Observer, Receiver<String>) {
+    fn marker(helper: usize, id: &str) -> Marker {
+        Marker {
+            helper,
+            id: id.into(),
+        }
+    }
+
+    fn detector() -> (Observer, Receiver<Marker>) {
         let (sender, receiver) = bounded(QUEUE_CAPACITY);
         (
             Observer {
@@ -224,49 +251,67 @@ mod tests {
 
     #[test]
     fn visible_markers_survive_every_read_boundary_and_redraw() {
-        for text in [
-            format!("TCRIT-{ID}\r\n"),
-            format!("TCRIT-\x1b[31m{ID}\x1b[m\r\n"),
-            format!("old text\rTCRIT-{ID}\x1b[K\r\n"),
-            format!("\x1b[4;8HTCRIT-{ID}\x1b[1;1H"),
-            format!("\x1b]8;;https://example.test\x1b\\TCRIT-{ID}\x1b]8;;\x1b\\\r\n"),
-        ] {
-            for split in 0..=text.len() {
+        for (helper, (prefix, _)) in HELPERS.iter().enumerate() {
+            for text in [
+                format!("{prefix}{ID}\r\n"),
+                format!("{prefix}\x1b[31m{ID}\x1b[m\r\n"),
+                format!("old text\r{prefix}{ID}\x1b[K\r\n"),
+                format!("\x1b[4;8H{prefix}{ID}\x1b[1;1H"),
+                format!("\x1b]8;;https://example.test\x1b\\{prefix}{ID}\x1b]8;;\x1b\\\r\n"),
+            ] {
+                for split in 0..=text.len() {
+                    let (mut observer, receiver) = detector();
+                    observer.observe(&text.as_bytes()[..split]);
+                    observer.observe(&text.as_bytes()[split..]);
+                    assert_eq!(
+                        receiver.try_recv().unwrap(),
+                        marker(helper, ID),
+                        "split {split}: {text:?}"
+                    );
+                    observer.observe(format!("\x1b[H{prefix}{ID}\r\n").as_bytes());
+                    assert!(receiver.is_empty());
+                }
                 let (mut observer, receiver) = detector();
-                observer.observe(&text.as_bytes()[..split]);
-                observer.observe(&text.as_bytes()[split..]);
-                assert_eq!(receiver.try_recv().unwrap(), ID, "split {split}: {text:?}");
-                observer.observe(format!("\x1b[HTCRIT-{ID}\r\n").as_bytes());
+                for byte in text.bytes() {
+                    observer.observe(&[byte]);
+                }
+                assert_eq!(receiver.try_recv().unwrap(), marker(helper, ID));
                 assert!(receiver.is_empty());
             }
-            let (mut observer, receiver) = detector();
-            for byte in text.bytes() {
-                observer.observe(&[byte]);
-            }
-            assert_eq!(receiver.try_recv().unwrap(), ID);
-            assert!(receiver.is_empty());
         }
     }
 
     #[test]
+    fn both_marker_kinds_are_reported_separately() {
+        let (mut observer, receiver) = detector();
+        observer.observe(format!("CRITTY-{ID}\r\nTCRIT-{ID}\r\n").as_bytes());
+        assert_eq!(receiver.try_recv().unwrap(), marker(0, ID));
+        assert_eq!(receiver.try_recv().unwrap(), marker(1, ID));
+        assert!(receiver.is_empty());
+    }
+
+    #[test]
     fn incomplete_invalid_and_metadata_tokens_are_not_notifications() {
-        for text in [
-            format!("TCRIT-{ID}"),
-            format!("TCRIT-{ID}0\r\n"),
-            format!("TCRIT-{ID}A\r\n"),
-            format!("TCRIT-{}\r\n", ID.to_uppercase()),
-            format!("TCRIT-{}\r\n", &ID[..31]),
-            format!("TCRIT-{}\r\n{}\r\n", &ID[..16], &ID[16..]),
-            format!("\x1b]0;TCRIT-{ID}\x07\r\n"),
-            format!("\x1b]8;;TCRIT-{ID}\x1b\\link\x1b]8;;\x1b\\\r\n"),
-            format!("\x1bPqTCRIT-{ID}\x1b\\\r\n"),
-            format!("\x1bPtmux;\x1b\x1b]0;TCRIT-{ID}\x07\x1b\\\r\n"),
-        ] {
-            for split in 0..=text.len() {
-                let (mut observer, receiver) = detector();
-                observer.observe(&text.as_bytes()[..split]);
-                observer.observe(&text.as_bytes()[split..]);
-                assert!(receiver.is_empty(), "split {split}: {text:?}");
+        for (prefix, _) in HELPERS {
+            for text in [
+                format!("{prefix}{ID}"),
+                format!("{prefix}{ID}0\r\n"),
+                format!("{prefix}{ID}A\r\n"),
+                format!("{prefix}{}\r\n", ID.to_uppercase()),
+                format!("{prefix}{}\r\n", &ID[..31]),
+                format!("{prefix}{}\r\n{}\r\n", &ID[..16], &ID[16..]),
+                format!("{}{ID}\r\n", prefix.to_lowercase()),
+                format!("\x1b]0;{prefix}{ID}\x07\r\n"),
+                format!("\x1b]8;;{prefix}{ID}\x1b\\link\x1b]8;;\x1b\\\r\n"),
+                format!("\x1bPq{prefix}{ID}\x1b\\\r\n"),
+                format!("\x1bPtmux;\x1b\x1b]0;{prefix}{ID}\x07\x1b\\\r\n"),
+            ] {
+                for split in 0..=text.len() {
+                    let (mut observer, receiver) = detector();
+                    observer.observe(&text.as_bytes()[..split]);
+                    observer.observe(&text.as_bytes()[split..]);
+                    assert!(receiver.is_empty(), "split {split}: {text:?}");
+                }
             }
         }
     }
@@ -275,7 +320,7 @@ mod tests {
     fn erased_scrolled_and_alternate_screen_content_is_not_visible() {
         for suffix in ["\r\x1b[2K", "\x1b[2J", "\x1b[?1049h", &"\r\n".repeat(25)] {
             let (mut observer, receiver) = detector();
-            observer.observe(format!("TCRIT-{ID}{suffix}").as_bytes());
+            observer.observe(format!("CRITTY-{ID}{suffix}").as_bytes());
             assert!(receiver.is_empty(), "{suffix:?}");
         }
     }
@@ -283,10 +328,10 @@ mod tests {
     #[test]
     fn cursor_overwrites_and_resize_preserve_parser_state() {
         let (mut observer, receiver) = detector();
-        observer.observe(format!("TCRIT-{}x\r\n", &ID[..31]).as_bytes());
+        observer.observe(format!("CRITTY-{}x\r\n", &ID[..31]).as_bytes());
         assert!(receiver.is_empty());
-        observer.observe(b"\x1b[1;38Hf\r\n");
-        assert_eq!(receiver.try_recv().unwrap(), ID);
+        observer.observe(b"\x1b[1;39Hf\r\n");
+        assert_eq!(receiver.try_recv().unwrap(), marker(0, ID));
         observer.observe(b"\x1b[?1049h\x1b[31");
         for cols in [1, 4, 53, 100] {
             observer.resize(6, cols);
@@ -294,20 +339,20 @@ mod tests {
         }
         observer.observe(b"\x1b[?1049l\x1b[2J\x1b[H");
         let next = "f".repeat(32);
-        observer.observe(format!("TCRIT-{next}\r\n").as_bytes());
-        assert_eq!(receiver.try_recv().unwrap(), next);
+        observer.observe(format!("CRITTY-{next}\r\n").as_bytes());
+        assert_eq!(receiver.try_recv().unwrap(), marker(0, &next));
     }
 
     #[test]
     fn queue_and_deduplication_have_fixed_bounds_and_expire() {
         let (mut observer, receiver) = detector();
         for index in 0..SEEN_CAPACITY + 10 {
-            observer.observe(format!("\x1b[HTCRIT-{index:032x}\r\n").as_bytes());
+            observer.observe(format!("\x1b[HCRITTY-{index:032x}\r\n").as_bytes());
         }
         assert_eq!(receiver.len(), QUEUE_CAPACITY);
         assert_eq!(observer.seen.len(), SEEN_CAPACITY);
         while receiver.try_recv().is_ok() {}
-        observer.observe(format!("\x1b[HTCRIT-{:032x}\r\n", SEEN_CAPACITY + 9).as_bytes());
+        observer.observe(format!("\x1b[HCRITTY-{:032x}\r\n", SEEN_CAPACITY + 9).as_bytes());
         assert!(receiver.is_empty());
         let expired = Instant::now() - SEEN_TTL;
         for (_, when) in &mut observer.seen {
@@ -318,12 +363,16 @@ mod tests {
         assert_eq!(observer.seen.len(), 1);
     }
 
-    fn script(dir: &std::path::Path, body: &str) -> Config {
-        let program = dir.join("tcrit");
+    fn script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        let program = dir.join(name);
         std::fs::write(&program, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        program
+    }
+
+    fn config(critty: Option<PathBuf>, tcrit: Option<PathBuf>) -> Config {
         Config {
-            program,
+            programs: [critty, tcrit],
             environment: vec![],
         }
     }
@@ -331,10 +380,12 @@ mod tests {
     #[test]
     fn helper_gets_exact_arguments_and_captured_environment() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = script(
+        let program = script(
             dir.path(),
+            "critty",
             "printf '%s\\n' \"$@\" \"$TMUX\" \"$TMUX_PANE\" \"$HERDR_SOCKET_PATH\" \"$HERDR_WORKSPACE_ID\" \"$HERDR_TAB_ID\" \"$HERDR_PANE_ID\" \"$XDG_STATE_HOME\" \"$PATH\" > \"$REPORT\"",
         );
+        let mut config = config(Some(program), None);
         let report = dir.path().join("report");
         config.environment = [
             ("REPORT", report.to_str().unwrap()),
@@ -351,7 +402,7 @@ mod tests {
         .map(|(k, v)| (k.into(), v.into()))
         .collect();
         let (sender, receiver) = bounded(1);
-        sender.send(ID.into()).unwrap();
+        sender.send(marker(0, ID)).unwrap();
         drop(sender);
         notify(config, receiver, Arc::new(AtomicBool::new(false)));
         assert_eq!(
@@ -363,18 +414,50 @@ mod tests {
     }
 
     #[test]
+    fn each_marker_kind_notifies_its_own_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("report");
+        let program = |name: &str| {
+            Some(script(
+                dir.path(),
+                name,
+                &format!("echo {name} \"$3\" >> \"$REPORT\""),
+            ))
+        };
+        for (critty, tcrit, expected) in [
+            (program("critty"), program("tcrit"), "critty a\ntcrit b\n"),
+            (program("critty"), None, "critty a\n"),
+            (None, program("tcrit"), "tcrit b\n"),
+        ] {
+            let _ = std::fs::remove_file(&report);
+            let mut config = config(critty, tcrit);
+            config.environment = vec![("REPORT".into(), report.clone().into_os_string())];
+            let (sender, receiver) = bounded(2);
+            sender.send(marker(0, "a")).unwrap();
+            sender.send(marker(1, "b")).unwrap();
+            drop(sender);
+            notify(config, receiver, Arc::new(AtomicBool::new(false)));
+            assert_eq!(std::fs::read_to_string(&report).unwrap(), expected);
+        }
+    }
+
+    #[test]
     fn missing_and_unsuccessful_helpers_do_not_stop_the_worker() {
         let dir = tempfile::tempdir().unwrap();
         for config in [
-            script(dir.path(), "echo ignored; echo ignored >&2; exit 17"),
-            Config {
-                program: dir.path().join("missing"),
-                environment: vec![],
-            },
+            config(
+                Some(script(
+                    dir.path(),
+                    "critty",
+                    "echo ignored; echo ignored >&2; exit 17",
+                )),
+                None,
+            ),
+            config(Some(dir.path().join("missing")), None),
         ] {
             let (sender, receiver) = bounded(2);
-            sender.send(ID.into()).unwrap();
-            sender.send(ID.into()).unwrap();
+            sender.send(marker(0, ID)).unwrap();
+            sender.send(marker(0, ID)).unwrap();
             drop(sender);
             notify(config, receiver, Arc::new(AtomicBool::new(false)));
         }
@@ -385,12 +468,19 @@ mod tests {
         for shutdown in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let pid_file = dir.path().join("pid");
-            let mut config = script(dir.path(), "echo $$ > \"$PID_FILE\"; exec /bin/sleep 30");
+            let mut config = config(
+                Some(script(
+                    dir.path(),
+                    "critty",
+                    "echo $$ > \"$PID_FILE\"; exec /bin/sleep 30",
+                )),
+                None,
+            );
             config
                 .environment
                 .push(("PID_FILE".into(), pid_file.clone().into_os_string()));
             let mut observer = Observer::start(config, 24, 100).unwrap();
-            observer.observe(format!("TCRIT-{ID}\r\n").as_bytes());
+            observer.observe(format!("CRITTY-{ID}\r\n").as_bytes());
             let deadline = Instant::now() + Duration::from_secs(5);
             while !pid_file.exists() {
                 assert!(Instant::now() < deadline);

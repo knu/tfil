@@ -29,7 +29,7 @@ pub(crate) struct Options {
     pub restore_cursor: bool,
     pub tmux_pointer: bool,
     pub dump: Option<File>,
-    pub notify: Option<crate::tcrit_notify::Config>,
+    pub notify: Option<crate::critty_notify::Config>,
 }
 
 #[derive(Debug)]
@@ -167,7 +167,7 @@ pub(crate) fn run(
     let mut coordinator = Coordinator::new(mouse, options.restore_cursor, options.tmux_pointer);
     if let Some(config) = options.notify {
         let size = crate::current_pty_size();
-        coordinator.notify = crate::tcrit_notify::Observer::start(config, size.rows, size.cols);
+        coordinator.notify = crate::critty_notify::Observer::start(config, size.rows, size.cols);
     }
     let result = coordinator.run(
         ports,
@@ -267,7 +267,7 @@ impl Workers {
 
 struct Coordinator {
     mouse: Option<CodexMouseUi>,
-    notify: Option<crate::tcrit_notify::Observer>,
+    notify: Option<crate::critty_notify::Observer>,
     restore_cursor: bool,
     tmux_pointer: bool,
     pending_terminal: Option<TerminalCommand>,
