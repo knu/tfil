@@ -65,7 +65,7 @@ Some terminals manage the pointer shape themselves while mouse tracking is activ
 
 ### Critty integration
 
-`--critty-notify` helps [Critty](https://github.com/knu/tcrit), a terminal code review tool, locate Codex running in tmux or Herdr.  Codex's daemon mode, enabled by default since [0.157.0](https://github.com/openai/codex/releases/tag/rust-v0.157.0), can prevent Critty from identifying the terminal directly.  tfil detects markers in Codex's output and notifies Critty of the terminal to use for the review.
+`--critty-notify` helps [Critty](https://github.com/crittylabs/critty), a terminal code review tool, locate Codex running in tmux or Herdr.  Codex's daemon mode, enabled by default since [0.157.0](https://github.com/openai/codex/releases/tag/rust-v0.157.0), can prevent Critty from identifying the terminal directly.  tfil detects markers in Codex's output and notifies Critty of the terminal to use for the review.
 
 ```console
 % tfil --critty-notify codex
