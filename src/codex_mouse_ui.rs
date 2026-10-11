@@ -540,7 +540,7 @@ fn is_continuation(line: &str) -> bool {
 fn queued_question_binding_in(rows: &[String], row: usize) -> Option<&'static [u8]> {
     let summary = rows.get(row)?.strip_prefix("  ? ")?;
     let binding = match rows.get(row + 1)?.trim() {
-        "shift + ← to answer" | "shift+← to answer" => SHIFT_ARROW_LEFT,
+        "shift + ← to answer" | "shift+← to answer" | "⇧← to answer" => SHIFT_ARROW_LEFT,
         "⌥+↑ to answer" | "alt+↑ to answer" => ALT_ARROW_UP,
         _ => return None,
     };
@@ -877,9 +877,10 @@ mod tests {
     }
 
     #[test]
-    fn queued_question_uses_codex_0157_displayed_binding() {
+    fn queued_question_uses_displayed_binding() {
         for (hint, expected) in [
             ("shift+←", SHIFT_ARROW_LEFT),
+            ("⇧←", SHIFT_ARROW_LEFT),
             ("⌥+↑", b"\x1b[1;3A".as_slice()),
             ("alt+↑", b"\x1b[1;3A".as_slice()),
         ] {
