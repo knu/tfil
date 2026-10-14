@@ -8,6 +8,12 @@ version bumps for fixes.  Once `1.0.0` ships, the project will revisit and
 likely adopt strict [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.4.3] - 2026-10-15
+
+### Fixed
+
+- Restore mouse selection on Codex's sign-in picker.  Hover or click an option or its description to select it, then click to confirm.
+
 ## [0.4.2] - 2026-10-12
 
 ### Fixed
