@@ -49,6 +49,8 @@ Collapsed `? N question(s)` rows under `Queued follow-up inputs` also show a han
 
 The `Managed worktrees` browser also supports hovering and clicking unnumbered entries, including a single search result.  Detection requires the browser's heading, description, and standard Enter/Escape hint to remain visible; wrapped or ambiguous layouts fall back to keyboard navigation.
 
+The onboarding sign-in picker, which marks its numbered options with an ASCII `>`, also supports hovering and clicking an option or its description.  Detection requires the picker's intro text and `Press enter to continue` hint to remain visible; wrapped or ambiguous layouts fall back to keyboard navigation.
+
 Mouse events the menu logic does not consume are forwarded only when the child has enabled a mouse protocol of its own, using the encoding requested by the child.  This preserves Codex's native text selection, right-click copying, and scrolling outside detected menus.  Modified mouse motion is forwarded without steering menus.  When a menu click is consumed, its drag and release events are consumed as well.
 
 ```console

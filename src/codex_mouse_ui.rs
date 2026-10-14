@@ -10,7 +10,8 @@
 //! mouse) and switches the terminal's mouse pointer shape via OSC 22;
 //! a click sends Enter to confirm the selection.
 //! Collapsed queued questions with a supported shortcut hint can be clicked to open.
-//! The searchable Managed worktrees list also supports hover and click.
+//! The searchable Managed worktrees list and the onboarding sign-in
+//! picker also support hover and click.
 //!
 //! Events the menu logic does not consume are forwarded to the child
 //! only when the child has requested a mouse protocol of its own, in
@@ -414,6 +415,7 @@ impl CodexMouseUi {
         let (_, cols) = screen.size();
         let rows: Vec<String> = screen.rows(0, cols.get()).collect();
         worktree_lookup_in(&rows, usize::from(row))
+            .or_else(|| login_lookup_in(&rows, usize::from(row)))
             .or_else(|| menu_lookup_in(&rows, usize::from(row)))
     }
 
@@ -575,7 +577,7 @@ fn queued_question_binding_in(rows: &[String], row: usize) -> Option<&'static [u
 struct MenuLookup {
     /// Screen rows of the block's option lines, in order.
     options: Vec<usize>,
-    /// Index (into `options`) of the `›`-marked option.
+    /// Index (into `options`) of the selection-marked option.
     marked_idx: usize,
     /// Index (into `options`) of the clicked/hovered option.
     clicked_idx: usize,
@@ -630,6 +632,81 @@ fn worktree_lookup_in(rows: &[String], clicked: usize) -> Option<MenuLookup> {
         options: (start..end).collect(),
         marked_idx: marked?,
         clicked_idx: clicked - start,
+    })
+}
+
+/// Parses a sign-in option line (`> 1. Sign in with ChatGPT` or
+/// `  2. Sign in with Device Code`) numbered `expected`, returning
+/// whether it carries the ASCII selection marker.
+fn parse_login_option_line(line: &str, expected: usize) -> Option<bool> {
+    let (marked, rest) = match line.strip_prefix("> ") {
+        Some(rest) => (true, rest),
+        None => (false, line.strip_prefix("  ")?),
+    };
+    let text = rest.strip_prefix(&format!("{expected}. "))?;
+    (!text.is_empty() && !text.starts_with(' ')).then_some(marked)
+}
+
+/// Restrict the sign-in picker's ASCII `>`-marked options to the screen
+/// bounded by its intro text and Enter hint.  Each option is followed by
+/// an indented description row, which also selects it, and a blank row.
+/// Wrapped or otherwise unexpected layouts fall back to keyboard
+/// navigation.
+fn login_lookup_in(rows: &[String], clicked: usize) -> Option<MenuLookup> {
+    let footer = clicked
+        + rows[clicked.min(rows.len())..]
+            .iter()
+            .position(|line| line.trim() == "Press enter to continue")?;
+    let header = rows[..footer].iter().rposition(|line| {
+        matches!(
+            line.trim(),
+            "or connect an API key for usage-based billing" | "Choose how you want to use Codex."
+        )
+    })?;
+    if header + 1 >= clicked || !rows[header + 1].trim().is_empty() {
+        return None;
+    }
+    let mut options: Vec<(usize, bool)> = Vec::new();
+    let mut clicked_idx = None;
+    let mut described = true;
+    for (row, line) in rows.iter().enumerate().take(footer).skip(header + 2) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(marked) = parse_login_option_line(line, options.len() + 1) {
+            if !described {
+                return None;
+            }
+            options.push((row, marked));
+            described = false;
+        } else if !described && line.starts_with("     ") && !line.starts_with("      ") {
+            if line.trim() == "ChatGPT login is disabled" {
+                return None;
+            }
+            described = true;
+        } else if line.trim()
+            == "API key login is disabled by this workspace. Sign in with ChatGPT to continue."
+        {
+            continue;
+        } else {
+            return None;
+        }
+        if row == clicked {
+            clicked_idx = Some(options.len() - 1);
+        }
+    }
+    if options.len() < 2 || !described {
+        return None;
+    }
+    let mut marked_iter = options.iter().enumerate().filter(|(_, (_, m))| *m);
+    let (marked_idx, _) = marked_iter.next()?;
+    if marked_iter.next().is_some() {
+        return None;
+    }
+    Some(MenuLookup {
+        options: options.into_iter().map(|(r, _)| r).collect(),
+        marked_idx,
+        clicked_idx: clicked_idx?,
     })
 }
 
@@ -792,6 +869,121 @@ mod tests {
             let mut altered = rows.clone();
             altered[row] = replacement.to_string();
             assert!(worktree_lookup_in(&altered, 4).is_none());
+        }
+    }
+
+    const LOGIN: &str = concat!(
+        "  Welcome to Codex, OpenAI's command-line coding agent\r\n",
+        "\r\n",
+        "  Sign in with ChatGPT to use Codex as part of your paid plan\r\n",
+        "  or connect an API key for usage-based billing\r\n",
+        "\r\n",
+        "> 1. Sign in with ChatGPT\r\n",
+        "     Usage included with Plus, Pro, Business, and Enterprise plans\r\n",
+        "\r\n",
+        "  2. Sign in with Device Code\r\n",
+        "     Sign in from another device with a one-time code\r\n",
+        "\r\n",
+        "  3. Provide your own API key\r\n",
+        "     Pay for what you use\r\n",
+        "\r\n",
+        "  Press enter to continue\r\n",
+    );
+
+    #[test]
+    fn login_hover_and_click_steer_ascii_marked_options() {
+        let mut m = CodexMouseUi::new(24, 100);
+        m.on_output(INTERACTIVE_ENABLE);
+        m.on_output(LOGIN.as_bytes());
+        assert_eq!(
+            m.on_input(&sgr(35, 10, 11, false)),
+            ([ARROW_DOWN, ARROW_DOWN].concat(), POINTER_ON.to_vec())
+        );
+        // The description row selects its option too.
+        assert_eq!(m.on_input(&sgr(35, 10, 9, false)).0, ARROW_UP);
+        assert_eq!(m.on_input(&sgr(0, 10, 9, false)).0, b"\r");
+        assert!(m.on_input(&sgr(0, 10, 9, true)).0.is_empty());
+        for row in [4, 7, 10, 13, 14] {
+            assert_eq!(
+                m.on_input(&sgr(35, 10, row, false)),
+                (vec![], POINTER_OFF.to_vec()),
+                "row {row}"
+            );
+            m.on_input(&sgr(35, 10, 5, false));
+        }
+    }
+
+    #[test]
+    fn login_detection_accepts_bedrock_and_disabled_api_layouts() {
+        let bedrock = LOGIN
+            .replace(
+                concat!(
+                    "  Sign in with ChatGPT to use Codex as part of your paid plan\r\n",
+                    "  or connect an API key for usage-based billing\r\n",
+                ),
+                "  Choose how you want to use Codex.\r\n",
+            )
+            .replace("Provide your own API key", "Use an OpenAI API key")
+            .replace(
+                "  Press enter",
+                concat!(
+                    "  4. Use Amazon Bedrock\r\n",
+                    "     Connect using your AWS credentials\r\n",
+                    "\r\n",
+                    "  Press enter",
+                ),
+            );
+        let rows: Vec<String> = bedrock.split("\r\n").map(str::to_string).collect();
+        let lookup = login_lookup_in(&rows, 13).unwrap();
+        assert_eq!(
+            (lookup.options, lookup.marked_idx, lookup.clicked_idx),
+            (vec![4, 7, 10, 13], 0, 3)
+        );
+
+        let disabled = LOGIN.replace(
+            concat!(
+                "  3. Provide your own API key\r\n",
+                "     Pay for what you use\r\n",
+                "\r\n",
+                "  Press enter",
+            ),
+            concat!(
+                "  API key login is disabled by this workspace. Sign in with ChatGPT to continue.\r\n",
+                "\r\n",
+                "  Press enter",
+            ),
+        );
+        let rows: Vec<String> = disabled.split("\r\n").map(str::to_string).collect();
+        assert!(login_lookup_in(&rows, 8).is_some());
+        assert!(login_lookup_in(&rows, 11).is_none());
+    }
+
+    #[test]
+    fn login_detection_rejects_unrelated_and_ambiguous_layouts() {
+        let rows: Vec<String> = LOGIN.split("\r\n").map(str::to_string).collect();
+        for row in [0, 2, 3, 4, 7, 14, 99] {
+            assert!(login_lookup_in(&rows, row).is_none(), "row {row}");
+        }
+        for (row, replacement) in [
+            (3, "  or something else"),
+            (4, "  not blank"),
+            (5, "› 1. Sign in with ChatGPT"),
+            (5, "  1. Sign in with ChatGPT"),
+            (6, "     ChatGPT login is disabled"),
+            (6, "   wrapped"),
+            (6, "wrapped description text"),
+            (8, "  3. Sign in with Device Code"),
+            (8, "> 2. Sign in with Device Code"),
+            (9, "  2. Another option"),
+            (14, "  Press enter to confirm or esc to cancel"),
+        ] {
+            let mut altered = rows.clone();
+            altered[row] = replacement.to_string();
+            assert!(login_lookup_in(&altered, 8).is_none(), "{replacement:?}");
+        }
+        // The generic menu detection does not pick these rows up either.
+        for row in 5..=13 {
+            assert!(menu_lookup_in(&rows, row).is_none(), "row {row}");
         }
     }
 
