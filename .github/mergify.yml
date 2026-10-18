@@ -1,9 +1,7 @@
+extends: .github
+
 queue_rules:
   - name: dependency-updates
-    batch_size: 5
-    batch_max_wait_time: 10 min
-    checks_timeout: auto
-    merge_method: merge-batch
     queue_conditions:
       - base = main
       - author ~= ^(dependabot|renovate|lockfile-maintenance)\[bot\]$
@@ -20,4 +18,3 @@ merge_protections_settings:
     - -draft
     - -conflict
     - "#approved-reviews-by >= 1"
-  reporting_method: check-runs
