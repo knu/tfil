@@ -66,13 +66,23 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "atuin-vt100"
-version = "0.19.1"
+version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6541b562687e0c6682aa49aec5b7fc21aae2d57e1e228d492dcde84d3925059a"
+checksum = "9546310339d212a866db36a2d5f8eb9ad947cc6e0dfe74d6374a61404c580783"
 dependencies = [
+ "atuin-vte",
  "itoa",
  "unicode-width",
- "vte",
+]
+
+[[package]]
+name = "atuin-vte"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b550bb2a697dda1aa6db51a4163fbb356554b20bbabd65bb52a6664ea416f67e"
+dependencies = [
+ "arrayvec",
+ "memchr",
 ]
 
 [[package]]
@@ -489,16 +499,6 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
-
-[[package]]
-name = "vte"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
-dependencies = [
- "arrayvec",
- "memchr",
-]
 
 [[package]]
 name = "vtparse"
