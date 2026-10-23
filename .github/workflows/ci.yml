@@ -39,7 +39,7 @@ jobs:
     needs:
       - test
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     outputs:
@@ -196,7 +196,7 @@ jobs:
       - plan
       - build-local-artifacts
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     env:
@@ -312,7 +312,7 @@ jobs:
       - build-global-artifacts
       - publish-crate
     if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && needs.plan.result == 'success' && needs.publish-crate.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     env:
