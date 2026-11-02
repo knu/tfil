@@ -18,7 +18,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
@@ -51,12 +51,12 @@ jobs:
 
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@v2.22.2
         with:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
           ref: ${{ github.ref_name }}
@@ -70,7 +70,7 @@ jobs:
             sh
 
       - name: Cache dist
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/dist
@@ -87,7 +87,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Upload dist manifest
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: artifacts-plan-dist-manifest
           path: plan-dist-manifest.json
@@ -112,7 +112,7 @@ jobs:
 
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@v2.22.2
         with:
           egress-policy: audit
 
@@ -120,7 +120,7 @@ jobs:
         run: git config --global core.longpaths true
 
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
           ref: ${{ needs.plan.outputs.tag }}
@@ -149,7 +149,7 @@ jobs:
         run: irm https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.ps1 | iex
 
       - name: Fetch local artifacts
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        uses: actions/download-artifact@v8.0.2
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -183,7 +183,7 @@ jobs:
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: artifacts-build-local-${{ join(matrix.targets, '_') }}
           path: |
@@ -206,19 +206,19 @@ jobs:
 
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@v2.22.2
         with:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
           ref: ${{ needs.plan.outputs.tag }}
           submodules: recursive
 
       - name: Install cached dist
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        uses: actions/download-artifact@v8.0.2
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
@@ -227,7 +227,7 @@ jobs:
         run: chmod +x ~/.cargo/bin/dist
 
       - name: Fetch local artifacts
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        uses: actions/download-artifact@v8.0.2
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -247,7 +247,7 @@ jobs:
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: artifacts-build-global
           path: |
@@ -271,12 +271,12 @@ jobs:
 
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@v2.22.2
         with:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
           ref: ${{ needs.plan.outputs.tag }}
@@ -297,7 +297,7 @@ jobs:
 
       - name: Authenticate with crates.io
         id: crates-io-auth
-        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9  # v1.0.6
+        uses: rust-lang/crates-io-auth-action@v1.0.6
 
       - name: Publish to crates.io
         env:
@@ -322,19 +322,19 @@ jobs:
 
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@v2.22.2
         with:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
           ref: ${{ needs.plan.outputs.tag }}
           submodules: recursive
 
       - name: Install cached dist
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        uses: actions/download-artifact@v8.0.2
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
@@ -343,7 +343,7 @@ jobs:
         run: chmod +x ~/.cargo/bin/dist
 
       - name: Fetch artifacts
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        uses: actions/download-artifact@v8.0.2
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -362,13 +362,13 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Upload dist manifest
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: artifacts-dist-manifest
           path: dist-manifest.json
 
       - name: Download GitHub artifacts
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        uses: actions/download-artifact@v8.0.2
         with:
           pattern: artifacts-*
           path: artifacts
