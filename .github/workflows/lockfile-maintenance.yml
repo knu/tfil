@@ -21,12 +21,19 @@ jobs:
 
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@v2.22.2
         with:
           egress-policy: audit
 
       - name: Update lockfile and create a pull request
-        uses: knu/lockfile-maintenance-action@3d087d142fbe60099a43d649279de30c02f94731 # v2.1.2
+        uses: knu/lockfile-maintenance-action@v2
         with:
           files: /Cargo.lock
           minimum-release-age: 3 days
+
+      - name: Maintain action pins
+        uses: knu/lockfile-maintenance-action@v2
+        with:
+          files: /.github/workflows/actions.lock
+          minimum-release-age: 7 days
+          branch: automation/actions-lock-maintenance
