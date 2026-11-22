@@ -123,3 +123,24 @@ fn exit_notification_follows_cleanup_and_preserves_child_status() {
         assert_eq!(actual, expected);
     }
 }
+
+#[test]
+fn terminal_string_filter_runs_without_tmux_management() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tfil"))
+        .env_remove("TMUX")
+        .args([
+            "--filter-terminal-strings",
+            "--",
+            "/bin/sh",
+            "-c",
+            r"printf 'before\033]52;clipboard\007after'",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _input = child.stdin.take();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"before\x18after");
+}

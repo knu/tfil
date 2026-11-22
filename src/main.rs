@@ -16,6 +16,8 @@ use tfil::filters::{
 mod critty_notify;
 mod session;
 mod terminal_output;
+mod terminal_string_filter;
+mod tmux_passthrough;
 mod wrapper;
 
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")");
@@ -65,6 +67,14 @@ struct Cli {
     /// `allow-passthrough on`)
     #[arg(long, value_name = "CODES", value_delimiter = ',')]
     tmux_osc_passthrough: Vec<u16>,
+
+    /// Filter child terminal strings, including raw passthrough and clipboard controls.
+    #[arg(long)]
+    filter_terminal_strings: bool,
+
+    /// Temporarily allow tmux passthrough from this pane, including when hidden.
+    #[arg(long)]
+    tmux_managed_passthrough: bool,
 
     /// Write the pre-filter PTY output stream to FILE for debugging.
     /// Defaults to TFIL_DEBUG_DUMP when set.
@@ -132,6 +142,12 @@ impl Cli {
         if self.notify_on_exit {
             args.push("--notify-on-exit".to_string());
         }
+        if self.filter_terminal_strings {
+            args.push("--filter-terminal-strings".to_string());
+        }
+        if self.tmux_managed_passthrough {
+            args.push("--tmux-managed-passthrough".to_string());
+        }
         if !self.tmux_osc_passthrough.is_empty() {
             let codes: Vec<String> = self
                 .tmux_osc_passthrough
@@ -154,6 +170,18 @@ impl Cli {
 }
 
 fn main() -> ExitCode {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == tmux_passthrough::WATCHDOG_ARG)
+    {
+        return match tmux_passthrough::watch() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("tfil: tmux passthrough watchdog: {error:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let cli = Cli::parse();
 
     if !cli.create_wrapper.is_empty() {
@@ -240,6 +268,12 @@ fn run(
         cmd.cwd(cwd);
     }
 
+    let in_tmux = std::env::var_os("TMUX").is_some_and(|value| !value.is_empty());
+    let _passthrough = if cli.tmux_managed_passthrough && in_tmux {
+        tmux_passthrough::PassthroughGuard::enter()?
+    } else {
+        None
+    };
     let mut child = pair.slave.spawn_command(cmd).context("spawn failed")?;
     drop(pair.slave);
 
@@ -253,26 +287,37 @@ fn run(
     if cli.strip_cursor_shape {
         filters.push(Box::new(CursorShapeFilter::new()));
     }
-    let focus = (!cli.strip_osc_unfocused.is_empty()).then(|| {
-        let focused = Arc::new(AtomicBool::new(false));
+    let focus_pointer = cli.filter_terminal_strings && cli.codex_mouse_ui;
+    let focus = (!cli.strip_osc_unfocused.is_empty() || focus_pointer)
+        .then(|| Arc::new(AtomicBool::new(false)));
+    if !cli.strip_osc_unfocused.is_empty() {
         filters.push(Box::new(OscFocusFilter::new(
             cli.strip_osc_unfocused,
-            Arc::clone(&focused),
+            Arc::clone(focus.as_ref().expect("OSC focus tracking enabled")),
         )));
-        focused
-    });
-    if !cli.tmux_osc_passthrough.is_empty() {
+    }
+    if cli.filter_terminal_strings {
+        filters.push(Box::new(
+            terminal_string_filter::TerminalStringFilter::default(),
+        ));
+    }
+    let wrap_osc =
+        !cli.tmux_osc_passthrough.is_empty() && (in_tmux || !cli.filter_terminal_strings);
+    if wrap_osc {
         filters.push(Box::new(TmuxOscPassthroughFilter::new(
             cli.tmux_osc_passthrough.clone(),
         )));
     }
-    let tmux_pointer = cli.tmux_osc_passthrough.contains(&22);
+    let tmux_pointer = wrap_osc && cli.tmux_osc_passthrough.contains(&22);
     let filters = FilterChain::new(filters);
 
     let mouse = cli.codex_mouse_ui.then(|| {
         let size = current_pty_size();
         let mut m = CodexMouseUi::new(size.rows, size.cols);
         m.set_tmux_pointer(tmux_pointer);
+        if focus_pointer && let Some(focused) = &focus {
+            m.set_pointer_focus(Arc::clone(focused));
+        }
         m
     });
 
@@ -299,7 +344,7 @@ fn run(
         let mut stdout = io::stdout().lock();
         // Reporting the exit is optional. Preserve the child's status even
         // if the terminal closes after the session has finished.
-        let _ = if std::env::var_os("TMUX").is_some_and(|value| !value.is_empty()) {
+        let _ = if in_tmux {
             stdout.write_all(&tmux_wrap(message.as_bytes()))
         } else {
             stdout.write_all(message.as_bytes())
@@ -431,6 +476,8 @@ mod tests {
             "--codex-mouse-ui",
             "--critty-notify",
             "--notify-on-exit",
+            "--filter-terminal-strings",
+            "--tmux-managed-passthrough",
             "--tmux-osc-passthrough=22,52",
             "--debug-dump=dump.log",
             "cmd",

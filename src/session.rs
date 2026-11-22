@@ -304,12 +304,14 @@ impl Coordinator {
 
     fn cleanup(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        if self.mouse.as_ref().is_some_and(CodexMouseUi::is_active) {
+        if let Some(mouse) = self.mouse.as_ref().filter(|mouse| mouse.is_active()) {
             bytes.extend_from_slice(MOUSE_DISABLE);
-            if self.tmux_pointer {
-                bytes.extend(tmux_wrap(POINTER_OFF));
-            } else {
-                bytes.extend_from_slice(POINTER_OFF);
+            if mouse.pointer_is_enabled() {
+                if self.tmux_pointer {
+                    bytes.extend(tmux_wrap(POINTER_OFF));
+                } else {
+                    bytes.extend_from_slice(POINTER_OFF);
+                }
             }
         }
         if self.restore_cursor {

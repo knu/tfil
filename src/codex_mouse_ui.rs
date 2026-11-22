@@ -20,6 +20,10 @@
 use crate::filters::tmux_wrap;
 use std::borrow::Cow;
 use std::num::NonZeroU16;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 /// Enables SGR any-motion mouse reporting on the outer terminal.
@@ -77,6 +81,7 @@ pub struct CodexMouseUi {
     steered_row: Option<usize>,
     /// Wrap pointer-shape OSCs in a tmux DCS passthrough.
     tmux_pointer: bool,
+    pointer_focus: Option<Arc<AtomicBool>>,
     active: bool,
     prev_modes: (MouseProtocolMode, MouseProtocolEncoding, bool),
     interactive_scan_carry: Vec<u8>,
@@ -101,6 +106,7 @@ impl CodexMouseUi {
             swallow_release: false,
             steered_row: None,
             tmux_pointer: false,
+            pointer_focus: None,
             active: false,
             prev_modes: Default::default(),
             interactive_scan_carry: Vec::new(),
@@ -120,6 +126,18 @@ impl CodexMouseUi {
     /// they reach the outer terminal through tmux.
     pub fn set_tmux_pointer(&mut self, on: bool) {
         self.tmux_pointer = on;
+    }
+
+    /// Sends pointer shape updates only after terminal focus is confirmed.
+    pub fn set_pointer_focus(&mut self, focused: Arc<AtomicBool>) {
+        self.pointer_focus = Some(focused);
+    }
+
+    /// Returns whether pointer shape updates can be sent.
+    pub fn pointer_is_enabled(&self) -> bool {
+        self.pointer_focus
+            .as_ref()
+            .is_none_or(|focused| focused.load(Ordering::Relaxed))
     }
 
     /// Reports whether Codex has started its interactive TUI.
@@ -377,6 +395,10 @@ impl CodexMouseUi {
     }
 
     fn set_pointer(&mut self, clickable: bool, out: &mut Vec<u8>) {
+        if !self.pointer_is_enabled() {
+            self.pointer = false;
+            return;
+        }
         if clickable != self.pointer {
             self.pointer = clickable;
             let seq = if clickable { POINTER_ON } else { POINTER_OFF };
@@ -1387,6 +1409,19 @@ mod tests {
         m.set_tmux_pointer(true);
         let (_, to_term) = m.on_input(&sgr(35, 10, 4, false));
         assert_eq!(to_term, tmux_wrap(POINTER_ON));
+    }
+
+    #[test]
+    fn managed_pointer_requires_focus() {
+        let mut m = menu();
+        let focused = Arc::new(AtomicBool::new(false));
+        m.set_tmux_pointer(true);
+        m.set_pointer_focus(Arc::clone(&focused));
+        assert!(m.on_input(&sgr(35, 10, 4, false)).1.is_empty());
+        focused.store(true, Ordering::Relaxed);
+        assert_eq!(m.on_input(&sgr(35, 10, 4, false)).1, tmux_wrap(POINTER_ON));
+        focused.store(false, Ordering::Relaxed);
+        assert!(m.on_output(b"\x1b[2J").is_empty());
     }
 
     #[test]
