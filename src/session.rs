@@ -12,6 +12,10 @@ use std::borrow::Cow;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 use tfil::codex_mouse_ui::{CodexMouseUi, MOUSE_DISABLE, POINTER_OFF};
@@ -28,8 +32,10 @@ const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
 pub(crate) struct Options {
     pub restore_cursor: bool,
     pub tmux_pointer: bool,
+    pub focus: Option<Arc<AtomicBool>>,
     pub dump: Option<File>,
     pub notify: Option<crate::critty_notify::Config>,
+    pub notify_on_exit: bool,
 }
 
 #[derive(Debug)]
@@ -126,9 +132,9 @@ pub(crate) fn run(
     let direct_input = mouse.is_none().then(|| child_tx.clone());
     let cancel = stop_rx.clone();
     spawn_worker(Worker::InputReader, completed_tx.clone(), move || {
-        read_input(io::stdin(), input_tx, cancel, direct_input)
+        read_input(io::stdin(), input_tx, cancel, direct_input, options.focus)
     });
-    let tracked = mouse.is_some() || options.restore_cursor;
+    let tracked = mouse.is_some() || options.restore_cursor || options.notify_on_exit;
     let failed = completed_tx.clone();
     let terminal_worker = spawn_worker(Worker::TerminalWriter, completed_tx.clone(), move || {
         write_terminal(io::stdout(), tracked, terminal_rx, recycle_tx, |error| {
@@ -666,7 +672,9 @@ fn read_input(
     tx: Sender<ReadEvent>,
     stop: Receiver<()>,
     direct: Option<Sender<InputCommand>>,
+    focused: Option<Arc<AtomicBool>>,
 ) -> Result<()> {
+    let mut focus_reports = FocusReports::default();
     let mut buffer = [0u8; 4096];
     loop {
         if stop.try_recv() != Err(TryRecvError::Empty) {
@@ -678,6 +686,9 @@ fn read_input(
                 return Ok(());
             }
             Ok(n) => {
+                if let Some(focused) = &focused {
+                    focus_reports.observe(&buffer[..n], focused);
+                }
                 let bytes = buffer[..n].to_vec();
                 let sent = if let Some(direct) = &direct {
                     send_event(direct, &stop, InputCommand::Data(bytes))
@@ -690,6 +701,51 @@ fn read_input(
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error).context("read terminal input"),
+        }
+    }
+}
+
+/// Observes focus reports without consuming them from the child's input.
+#[derive(Default)]
+struct FocusReports {
+    prefix: [u8; 6],
+    len: usize,
+    pasting: bool,
+}
+
+impl FocusReports {
+    fn observe(&mut self, bytes: &[u8], focused: &AtomicBool) {
+        const FOCUS_IN: &[u8] = b"\x1b[I";
+        const FOCUS_OUT: &[u8] = b"\x1b[O";
+        const PASTE_START: &[u8] = b"\x1b[200~";
+        const PASTE_END: &[u8] = b"\x1b[201~";
+
+        for &byte in bytes {
+            if byte == 0x1b {
+                self.prefix[0] = byte;
+                self.len = 1;
+            } else if self.len != 0 {
+                self.prefix[self.len] = byte;
+                self.len += 1;
+                let prefix = &self.prefix[..self.len];
+                let expected: &[&[u8]] = if self.pasting {
+                    &[PASTE_END]
+                } else {
+                    &[FOCUS_IN, FOCUS_OUT, PASTE_START]
+                };
+                if expected.contains(&prefix) {
+                    match prefix {
+                        FOCUS_IN | FOCUS_OUT => {
+                            focused.store(prefix == FOCUS_IN, Ordering::Relaxed);
+                        }
+                        PASTE_START | PASTE_END => self.pasting = prefix == PASTE_START,
+                        _ => unreachable!(),
+                    }
+                    self.len = 0;
+                } else if !expected.iter().any(|sequence| sequence.starts_with(prefix)) {
+                    self.len = 0;
+                }
+            }
         }
     }
 }
@@ -1288,6 +1344,22 @@ mod tests {
     }
 
     #[test]
+    fn focus_reports_span_reads_and_ignore_bracketed_paste() {
+        let focused = AtomicBool::new(false);
+        let mut reports = FocusReports::default();
+        reports.observe(b"x\x1b", &focused);
+        reports.observe(b"[I\x1b[20", &focused);
+        assert!(focused.load(Ordering::Relaxed));
+
+        reports.observe(b"0~\x1b[O\x1b[2", &focused);
+        assert!(focused.load(Ordering::Relaxed));
+
+        reports.observe(b"01~\x1b[\x1b[", &focused);
+        reports.observe(b"O", &focused);
+        assert!(!focused.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn direct_input_precedes_coordinated_eof() {
         let (events, rx) = bounded(1);
         let (_stop, cancel) = bounded(0);
@@ -1297,6 +1369,7 @@ mod tests {
             events,
             cancel,
             Some(commands.clone()),
+            None,
         )
         .unwrap();
         assert!(matches!(rx.recv().unwrap(), ReadEvent::Eof));

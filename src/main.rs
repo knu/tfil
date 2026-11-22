@@ -2,14 +2,15 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::ffi::OsString;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Arc, atomic::AtomicBool};
 use tfil::codex_mouse_ui::CodexMouseUi;
 use tfil::filters::{
-    CursorShapeFilter, Filter, FilterChain, InkFakeCursorFilter, OscTitleFilter,
-    TmuxOscPassthroughFilter,
+    CursorShapeFilter, Filter, FilterChain, InkFakeCursorFilter, OscFocusFilter, OscTitleFilter,
+    TmuxOscPassthroughFilter, tmux_wrap,
 };
 
 mod critty_notify;
@@ -38,6 +39,11 @@ struct Cli {
     #[arg(long)]
     strip_osc_titles: bool,
 
+    /// Drop the given OSC codes until the terminal reports focus, and while unfocused.
+    /// The child must enable terminal focus reporting.
+    #[arg(long, value_name = "CODES", value_delimiter = ',')]
+    strip_osc_unfocused: Vec<u16>,
+
     /// Make Codex CLI's ›-marked numbered menus mouse-driven: hovering
     /// moves the selection to follow the mouse, clicking confirms it,
     /// and a pointer cursor is shown over options (OSC 22)
@@ -48,6 +54,10 @@ struct Cli {
     /// environment; also notifies TCrit of its older markers
     #[arg(long, alias = "tcrit-notify")]
     critty_notify: bool,
+
+    /// Send a desktop notification with the child's exit status
+    #[arg(long)]
+    notify_on_exit: bool,
 
     /// Wrap the given OSC sequences (comma-separated codes, e.g. "22"
     /// or "22,52") in a tmux DCS passthrough so they reach the outer
@@ -105,11 +115,22 @@ impl Cli {
         if self.strip_osc_titles {
             args.push("--strip-osc-titles".to_string());
         }
+        if !self.strip_osc_unfocused.is_empty() {
+            let codes: Vec<String> = self
+                .strip_osc_unfocused
+                .iter()
+                .map(u16::to_string)
+                .collect();
+            args.push(format!("--strip-osc-unfocused={}", codes.join(",")));
+        }
         if self.codex_mouse_ui {
             args.push("--codex-mouse-ui".to_string());
         }
         if self.critty_notify {
             args.push("--critty-notify".to_string());
+        }
+        if self.notify_on_exit {
+            args.push("--notify-on-exit".to_string());
         }
         if !self.tmux_osc_passthrough.is_empty() {
             let codes: Vec<String> = self
@@ -232,6 +253,14 @@ fn run(
     if cli.strip_cursor_shape {
         filters.push(Box::new(CursorShapeFilter::new()));
     }
+    let focus = (!cli.strip_osc_unfocused.is_empty()).then(|| {
+        let focused = Arc::new(AtomicBool::new(false));
+        filters.push(Box::new(OscFocusFilter::new(
+            cli.strip_osc_unfocused,
+            Arc::clone(&focused),
+        )));
+        focused
+    });
     if !cli.tmux_osc_passthrough.is_empty() {
         filters.push(Box::new(TmuxOscPassthroughFilter::new(
             cli.tmux_osc_passthrough.clone(),
@@ -250,7 +279,8 @@ fn run(
     // Line editing belongs to the slave PTY; forward every input byte unchanged.
     let _raw_guard = RawModeGuard::enter()?;
     let debug_dump = debug_dump_path(cli.debug_dump.as_deref());
-    session::run(
+    let notify_on_exit = cli.notify_on_exit && io::stdout().is_terminal();
+    let status = session::run(
         child.as_mut(),
         pair.master,
         filters,
@@ -258,10 +288,25 @@ fn run(
         session::Options {
             restore_cursor: cli.strip_ink_fake_cursor,
             tmux_pointer,
+            focus,
             dump: debug_dump.as_deref().and_then(open_dump_file),
             notify,
+            notify_on_exit,
         },
-    )
+    )?;
+    if notify_on_exit {
+        let message = format!("\x1b]777;notify;tfil;Child exited with status {status}.\x07");
+        let mut stdout = io::stdout().lock();
+        // Reporting the exit is optional. Preserve the child's status even
+        // if the terminal closes after the session has finished.
+        let _ = if std::env::var_os("TMUX").is_some_and(|value| !value.is_empty()) {
+            stdout.write_all(&tmux_wrap(message.as_bytes()))
+        } else {
+            stdout.write_all(message.as_bytes())
+        }
+        .and_then(|()| stdout.flush());
+    }
+    Ok(status)
 }
 
 fn current_pty_size() -> PtySize {
@@ -382,8 +427,10 @@ mod tests {
             "--strip-cursor-shape",
             "--strip-ink-fake-cursor",
             "--strip-osc-titles",
+            "--strip-osc-unfocused=22,52",
             "--codex-mouse-ui",
             "--critty-notify",
+            "--notify-on-exit",
             "--tmux-osc-passthrough=22,52",
             "--debug-dump=dump.log",
             "cmd",

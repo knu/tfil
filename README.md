@@ -39,7 +39,29 @@ With no behavior options, `tfil` is a transparent PTY proxy.  Options can be com
 - `--strip-cursor-shape` — Drop DECSCUSR (`CSI Pn SP q`) so child programs cannot change the terminal's cursor shape.
 - `--strip-ink-fake-cursor` — Strip [Ink](https://github.com/vadimdemedes/ink)'s fake-cursor sequences (`\x1b[7m{grapheme}\x1b[27m` and friends), and suppress `\x1b[?25l` so the terminal's native cursor shows through.  Useful with Ink-based TUIs such as Claude Code, Gemini CLI, or ccmanager.
 - `--strip-osc-titles` — Drop OSC 0/1/2 sequences (icon name and window title).  Other OSCs (4 = palette, 8 = hyperlink, 52 = clipboard, ...) are passed through.  Both ST (`ESC \`) and BEL terminators are recognized.
+- `--strip-osc-unfocused=CODES` — Drop comma-separated OSC codes from child output until a focus-in report arrives, and after each focus-out report.  For example, `--strip-osc-unfocused=22` suppresses child pointer-shape updates while unfocused.  This works on plain OSCs before any tmux wrapping by tfil.  It requires a child that enables focus reporting and a terminal that sends focus reports.  In tmux, enable `focus-events` too.  Reports are forwarded to the child as usual.  Focus filtering is best-effort and depends on when the report arrives.
 - `--tmux-osc-passthrough=CODES` — Wrap the OSC sequences with the given comma-separated codes in a tmux `DCS tmux; ... ST` passthrough so they reach the outer terminal instead of being swallowed by tmux.  Requires tmux 3.3+ with `allow-passthrough on` set.
+
+### Using tmux passthrough with untrusted output
+
+`allow-passthrough all` lets an invisible pane send terminal controls to the outer terminal.  The focus filter above handles selected plain OSCs from the child before tfil wraps them.  It leaves child-supplied DCS passthrough and tfil-generated controls outside its scope.  Focus reports can also arrive after the focus has changed.
+
+If a pane displays untrusted output, keep `allow-passthrough off` for that pane unless a separate filter controls its output.  Use the following policy when building a filter for `all`.
+
+- Drop child-supplied DCS passthrough in every focus state.  Wrap only sequences the filter has validated.  Start with no other controls forwarded to the outer terminal.  Normal text, colors, and cursor movement can still be handled by tmux.
+- Block OSC 52 and 5522 clipboard reads and writes from the child in every focus state.  In tmux, `set-clipboard external` also blocks the regular OSC 52 path from applications while retaining copies initiated by tmux.  [tmux clipboard documentation](https://github.com/tmux/tmux/wiki/Clipboard#changing-set-clipboard) · [Ghostty clipboard protocols](https://ghostty.org/docs/install/release-notes/1-4-0#kitty-clipboard-protocol)
+- Keep child-supplied desktop notifications such as OSC 9 and 777 out of passthrough.  For background completion notifications, use `tfil --notify-on-exit`.  It sends a fixed notification with the exit status.  Leave titles, palette changes, working-directory updates, and graphics out of the outer-terminal allowlist until a specific use needs them.  [Ghostty notification settings](https://ghostty.org/docs/config/reference#desktop-notifications)
+- If a TUI needs OSC 22 pointer updates, allow only the required pointer values, and gate those updates on focus.  Use the focus filter for display behavior.  Enforce clipboard and passthrough restrictions in every focus state.
+
+### Desktop notification on exit
+
+`--notify-on-exit` sends an OSC 777 notification after the child exits and terminal cleanup finishes.  tfil uses a fixed title and message, with only the numeric exit status taken from the child.  It sends the notification only to terminal stdout and returns the child's exit status as usual.
+
+```console
+% tfil --notify-on-exit -- make test
+```
+
+Inside tmux, tfil wraps its own notification in a DCS passthrough.  Use `allow-passthrough on` for visible panes or `allow-passthrough all` if notifications must also reach the terminal from hidden panes.  The outer terminal must support OSC 777 and have desktop notifications enabled.  [Ghostty notification settings](https://ghostty.org/docs/config/reference#desktop-notifications)
 
 ### Interactive enhancements
 

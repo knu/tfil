@@ -85,3 +85,41 @@ fn queued_output_is_drained_before_cleanup_and_child_status_is_preserved() {
         assert_eq!(cleanup, b"\x1b[?25h");
     }
 }
+
+#[test]
+fn exit_notification_follows_cleanup_and_preserves_child_status() {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::io::Read;
+    use tfil::filters::tmux_wrap;
+
+    for tmux in [false, true] {
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tfil"));
+        command.args([
+            "--notify-on-exit",
+            "--strip-osc-unfocused=777",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'output\\033[?20'; exit 42",
+        ]);
+        command.env_remove("TMUX");
+        if tmux {
+            command.env("TMUX", "test");
+        }
+        let mut child = pair.slave.spawn_command(command).unwrap();
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).unwrap();
+        assert_eq!(child.wait().unwrap().exit_code(), 42);
+        let notification = b"\x1b]777;notify;tfil;Child exited with status 42.\x07";
+        let mut expected = b"output\x1b[?20\x18\x1b\\\x18".to_vec();
+        if tmux {
+            expected.extend(tmux_wrap(notification));
+        } else {
+            expected.extend_from_slice(notification);
+        }
+        assert_eq!(actual, expected);
+    }
+}
