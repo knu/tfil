@@ -8,6 +8,19 @@ version bumps for fixes.  Once `1.0.0` ships, the project will revisit and
 likely adopt strict [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.5.0] - 2026-11-23
+
+### Added
+
+- Add `--preset=codex` for Codex mouse integration and Critty terminal marker notifications, and `--preset=claude` to remove Claude Code's fake cursor.
+- Add `--filter-terminal-strings=auto` for tmux and herdr-core.  Preserve supported images and terminal status updates while gating pointer and clipboard controls on focus.
+- Add `--tmux-managed-passthrough` to enable passthrough for the current pane while tfil runs and restore the previous setting on exit.
+- Add focus-aware OSC filtering and optional notifications that report the child process's exit status.
+
+### Changed
+
+- Switch back to upstream vt100.
+
 ## [0.4.3] - 2026-10-15
 
 ### Fixed

@@ -1,6 +1,6 @@
 [package]
 name = "tfil"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2024"
 authors = ["Akinori Musha <knu@idaemons.org>"]
 default-run = "tfil"
