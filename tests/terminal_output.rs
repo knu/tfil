@@ -150,11 +150,23 @@ fn auto_terminal_strings_selects_transport_from_the_environment() {
     use tfil::filters::tmux_wrap;
 
     let status = b"\x1b]7501;state=working:app=example\x1b\\";
-    for (environment, expected) in [
-        (vec![], b"\x18".to_vec()),
-        (vec![("TMUX", "test")], tmux_wrap(status)),
+    let auto = ["--filter-terminal-strings=auto"];
+    let codex = ["--preset=codex"];
+    let strict_codex = ["--preset=codex", "--filter-terminal-strings=strict"];
+    for (environment, options, expected) in [
+        (vec![], auto.as_slice(), b"\x18".to_vec()),
+        (vec![], codex.as_slice(), status.to_vec()),
+        (vec![("TMUX", "test")], &auto, tmux_wrap(status)),
+        (vec![("TMUX", "test")], &codex, tmux_wrap(status)),
+        (vec![("TMUX", "test")], &strict_codex, b"\x18".to_vec()),
         (
             vec![("HC_TERMINAL_ID", "t1"), ("HC_TERMINAL_SOCKET", "/test")],
+            &auto,
+            status.to_vec(),
+        ),
+        (
+            vec![("HC_TERMINAL_ID", "t1"), ("HC_TERMINAL_SOCKET", "/test")],
+            &codex,
             status.to_vec(),
         ),
     ] {
@@ -163,8 +175,8 @@ fn auto_terminal_strings_selects_transport_from_the_environment() {
             .env_remove("HC_TERMINAL_ID")
             .env_remove("HC_TERMINAL_SOCKET")
             .envs(environment)
+            .args(options)
             .args([
-                "--filter-terminal-strings=auto",
                 "--",
                 "/bin/sh",
                 "-c",
@@ -178,5 +190,35 @@ fn auto_terminal_strings_selects_transport_from_the_environment() {
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, expected);
+    }
+}
+
+#[test]
+fn codex_preset_can_start_when_tmux_passthrough_setup_fails() {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::io::Read;
+
+    for explicit in [false, true] {
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tfil"));
+        command.env("TMUX", "invalid");
+        command.arg("--preset=codex");
+        if explicit {
+            command.arg("--tmux-managed-passthrough");
+        }
+        command.args(["--", "/bin/sh", "-c", "printf child-started; exit 42"]);
+        let mut child = pair.slave.spawn_command(command).unwrap();
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let mut output = String::new();
+        reader.read_to_string(&mut output).unwrap();
+
+        assert_eq!(
+            child.wait().unwrap().exit_code(),
+            if explicit { 1 } else { 42 }
+        );
+        assert_eq!(output.contains("child-started"), !explicit);
+        assert_eq!(output.contains("tmux passthrough setup skipped"), !explicit);
+        assert!(output.contains("invalid TMUX"));
     }
 }

@@ -41,10 +41,10 @@ With no behavior options, `tfil` is a transparent PTY proxy.  Options can be com
 % tfil --preset=claude claude --resume
 ```
 
-- `codex` enables `--codex-mouse-ui` and `--critty-notify`.
+- `codex` enables `--codex-mouse-ui` and `--critty-notify`.  It uses automatic filtering in tmux and herdr-core, relays allowed pointer-shape updates through tmux, and manages passthrough in a foreground tmux pane for image support.
 - `claude` enables `--strip-ink-fake-cursor`.
 
-Both presets use the current tmux passthrough setting.  Add `--tmux-osc-passthrough=22` to the `codex` preset to relay its pointer-shape updates from tmux.  See [Automatic terminal string filtering](#automatic-terminal-string-filtering) for a setup that keeps Codex images working.
+Outside tmux and herdr-core, the Codex preset leaves terminal-string filtering disabled unless you pass `--filter-terminal-strings` explicitly.  See [Automatic terminal string filtering](#automatic-terminal-string-filtering) for details.
 
 ### Output filters
 
@@ -70,11 +70,11 @@ With `--codex-mouse-ui`, tfil sends its own pointer updates when focus is confir
 ### Automatic terminal string filtering
 
 ```console
-% tfil --preset=codex --filter-terminal-strings=auto --tmux-managed-passthrough codex
+% tfil --preset=codex codex
 ```
 
-- **tmux**.  The managed option sets `allow-passthrough all` on the current pane before Codex starts and restores the previous setting on exit.  Omit it if the pane already uses `all`.  Codex needs fullscreen mode and a compatible tmux client to enable its image support.  tfil inspects the contents of each tmux passthrough and rebuilds the permitted sequences.  It checks Kitty image IDs against Codex's range for the pane.
-- **herdr-core**.  tfil passes validated Kitty graphics and OSC 7501 directly to the core.  The managed option has no effect here.  Ordinary terminals outside either environment use the strict filter.
+- **tmux**.  The Codex preset sets `allow-passthrough all` on a foreground pane before Codex starts and restores the previous setting on exit.  If setup fails, tfil reports the error and starts Codex with the available passthrough setting.  Pass `--tmux-managed-passthrough` explicitly to require successful setup.  Codex needs fullscreen mode and a compatible tmux client to enable its image support.  tfil inspects the contents of each tmux passthrough and rebuilds the permitted sequences.  It checks Kitty image IDs against Codex's range for the pane.
+- **herdr-core**.  tfil passes validated Kitty graphics and OSC 7501 directly to the core.  The managed option has no effect here.  An explicit `--filter-terminal-strings=auto` uses the strict filter outside both multiplexers.
 - **Focus**.  tfil allows OSC 22 (pointer shapes) and OSC 52/5522 (clipboard) only after a focus-in report and until the next focus-out report, including inside tmux passthrough.  The child must request terminal focus reports.  Enable `focus-events` in tmux.  Use `--strip-osc-unfocused` to add codes.  tfil bases its decision on input reports, which can arrive late.  Clipboard APIs and commands such as `tmux load-buffer` operate outside this output filter.
 - **Allowed output**.  Plain titles, tmux window names, and bells go to the multiplexer.  tfil allows valid OSC 9;4 progress, OSC 7501 status, and inline Kitty image commands regardless of focus.  The tfil mouse UI wraps its own pointer updates in tmux as needed.  `--tmux-osc-passthrough=22` can also wrap allowed pointer updates from the child.  tfil blocks child desktop notifications, other passthrough content, and Kitty file or shared-memory transfers.
 
@@ -142,7 +142,7 @@ Critty was formerly called TCrit.  `--tcrit-notify` remains an alias, and both o
 % tfil --create-wrapper=~/bin/codex --preset=codex
 ```
 
-Typing `claude` or `codex` then transparently runs the real command under `tfil` with the recommended enhancements.  Generated scripts store the individual options enabled by the preset.  `--create-wrapper` is repeatable, so brace expansion creates several wrappers with the same options at once:
+Typing `claude` or `codex` then transparently runs the real command under `tfil` with the recommended enhancements.  Generated Codex scripts keep `--preset=codex` to apply its defaults at launch.  `--create-wrapper` is repeatable, so brace expansion creates several wrappers with the same options at once:
 
 ```console
 % tfil --create-wrapper=~/bin/{claude,gemini} --strip-ink-fake-cursor

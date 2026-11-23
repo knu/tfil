@@ -24,7 +24,7 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"),
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Preset {
-    /// Enable Codex mouse UI and Critty integration
+    /// Enable Codex mouse UI, Critty integration, and filtering in supported multiplexers
     Codex,
     /// Strip Ink's fake cursor sequences
     Claude,
@@ -147,6 +147,10 @@ impl Cli {
     /// embedding into a wrapper script.
     fn to_wrapper_args(&self) -> Vec<String> {
         let mut args = Vec::new();
+        let codex_preset = matches!(self.preset, Some(Preset::Codex));
+        if codex_preset {
+            args.push("--preset=codex".to_string());
+        }
         if self.strip_cursor_shape {
             args.push("--strip-cursor-shape".to_string());
         }
@@ -164,10 +168,10 @@ impl Cli {
                 .collect();
             args.push(format!("--strip-osc-unfocused={}", codes.join(",")));
         }
-        if self.codex_mouse_ui {
+        if self.codex_mouse_ui && !codex_preset {
             args.push("--codex-mouse-ui".to_string());
         }
-        if self.critty_notify {
+        if self.critty_notify && !codex_preset {
             args.push("--critty-notify".to_string());
         }
         if self.notify_on_exit {
@@ -304,7 +308,13 @@ fn run(
     }
 
     let in_tmux = std::env::var_os("TMUX").is_some_and(|value| !value.is_empty());
-    let auto_endpoint = if cli.filter_terminal_strings == Some(TerminalStringMode::Auto) {
+    let codex_preset = matches!(cli.preset, Some(Preset::Codex));
+    let auto_filter = match cli.filter_terminal_strings {
+        Some(TerminalStringMode::Auto) => true,
+        Some(TerminalStringMode::Strict) => false,
+        None => codex_preset,
+    };
+    let auto_endpoint = if auto_filter {
         if in_tmux {
             Some(terminal_string_filter::Endpoint::Tmux {
                 image_base: tmux_passthrough::kitty_image_base(
@@ -322,8 +332,16 @@ fn run(
     } else {
         None
     };
-    let _passthrough = if cli.tmux_managed_passthrough && in_tmux {
-        tmux_passthrough::PassthroughGuard::enter()?
+    let manage_passthrough = cli.tmux_managed_passthrough
+        || (codex_preset && io::stdin().is_terminal() && io::stdout().is_terminal());
+    let _passthrough = if in_tmux && manage_passthrough {
+        match tmux_passthrough::PassthroughGuard::enter() {
+            Err(error) if !cli.tmux_managed_passthrough => {
+                eprintln!("tfil: tmux passthrough setup skipped: {error:#}");
+                None
+            }
+            result => result?,
+        }
     } else {
         None
     };
@@ -340,7 +358,13 @@ fn run(
     if cli.strip_cursor_shape {
         filters.push(Box::new(CursorShapeFilter::new()));
     }
-    let filter_strings = cli.filter_terminal_strings.is_some();
+    let tmux_osc_passthrough = if codex_preset && in_tmux && cli.tmux_osc_passthrough.is_empty() {
+        vec![22]
+    } else {
+        cli.tmux_osc_passthrough
+    };
+    let passthrough_pointer = tmux_osc_passthrough.contains(&22);
+    let filter_strings = auto_endpoint.is_some() || cli.filter_terminal_strings.is_some();
     let focus_pointer = filter_strings && cli.codex_mouse_ui;
     let focus = (auto_endpoint.is_some() || !cli.strip_osc_unfocused.is_empty() || focus_pointer)
         .then(|| Arc::new(AtomicBool::new(false)));
@@ -350,7 +374,7 @@ fn run(
                 endpoint,
                 Arc::clone(focus.as_ref().expect("auto filtering tracks focus")),
                 cli.strip_osc_unfocused,
-                cli.tmux_osc_passthrough.contains(&22),
+                passthrough_pointer,
                 cli.strip_osc_titles,
             )),
         ));
@@ -365,16 +389,14 @@ fn run(
             terminal_string_filter::TerminalStringFilter::default(),
         ));
     }
-    let wrap_osc = auto_endpoint.is_none()
-        && !cli.tmux_osc_passthrough.is_empty()
-        && (in_tmux || !filter_strings);
+    let wrap_osc =
+        auto_endpoint.is_none() && !tmux_osc_passthrough.is_empty() && (in_tmux || !filter_strings);
     if wrap_osc {
         filters.push(Box::new(TmuxOscPassthroughFilter::new(
-            cli.tmux_osc_passthrough.clone(),
+            tmux_osc_passthrough,
         )));
     }
-    let tmux_pointer = (auto_endpoint.is_some() && in_tmux)
-        || (wrap_osc && cli.tmux_osc_passthrough.contains(&22));
+    let tmux_pointer = (auto_endpoint.is_some() && in_tmux) || (wrap_osc && passthrough_pointer);
     let filters = FilterChain::new(filters);
 
     let mouse = cli.codex_mouse_ui.then(|| {
@@ -529,7 +551,7 @@ mod tests {
     fn wrapper_args_cover_all_behavior_options() {
         use clap::CommandFactory;
 
-        // Exclude options that are not serialized, including the expanded preset.
+        // Preset handling is exercised separately.
         const EXCLUDED: &[&str] = &[
             "preset",
             "wrap",
@@ -573,13 +595,10 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_args_expand_presets_and_keep_explicit_options() {
+    fn wrapper_args_keep_codex_preset_and_explicit_options() {
         let mut codex = Cli::parse_from(["tfil", "--preset=codex", "--create-wrapper=codex"]);
         codex.apply_preset();
-        assert_eq!(
-            codex.to_wrapper_args(),
-            ["--codex-mouse-ui", "--critty-notify"]
-        );
+        assert_eq!(codex.to_wrapper_args(), ["--preset=codex"]);
 
         let mut codex = Cli::parse_from([
             "tfil",
@@ -589,8 +608,14 @@ mod tests {
             "--create-wrapper=codex",
         ]);
         codex.apply_preset();
-        assert_eq!(codex.tmux_osc_passthrough, [133]);
-        assert!(codex.notify_on_exit);
+        assert_eq!(
+            codex.to_wrapper_args(),
+            [
+                "--preset=codex",
+                "--notify-on-exit",
+                "--tmux-osc-passthrough=133"
+            ]
+        );
 
         let mut claude = Cli::parse_from(["tfil", "--preset=claude", "cmd", "--resume"]);
         claude.apply_preset();

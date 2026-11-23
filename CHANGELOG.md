@@ -8,6 +8,13 @@ version bumps for fixes.  Once `1.0.0` ships, the project will revisit and
 likely adopt strict [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.5.1] - 2026-11-23
+
+### Fixed
+
+- Enable automatic terminal-string filtering for the Codex preset in tmux and herdr-core, and relay focused pointer-shape updates through tmux.  In a foreground tmux pane, the preset temporarily enables passthrough for image support.  Codex still starts if passthrough setup fails.
+- Keep `--preset=codex` in generated wrappers so they select these defaults at launch.
+
 ## [0.5.0] - 2026-11-23
 
 ### Added
