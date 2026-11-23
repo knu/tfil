@@ -11,6 +11,12 @@ use std::{
 
 pub(crate) const WATCHDOG_ARG: &str = "--internal-tmux-passthrough-watchdog";
 
+/// The 256 Kitty image IDs that Codex reserves for this tmux pane.
+pub(crate) fn kitty_image_base(pane: Option<&str>) -> Option<u32> {
+    let pane = pane?.strip_prefix('%')?.parse::<u32>().ok()?;
+    (pane < 0x8000).then(|| 0x80_0000 + (pane << 8))
+}
+
 pub(crate) struct PassthroughGuard(Child);
 
 impl PassthroughGuard {

@@ -144,3 +144,39 @@ fn terminal_string_filter_runs_without_tmux_management() {
     assert!(output.status.success());
     assert_eq!(output.stdout, b"before\x18after");
 }
+
+#[test]
+fn auto_terminal_strings_selects_transport_from_the_environment() {
+    use tfil::filters::tmux_wrap;
+
+    let status = b"\x1b]7501;state=working:app=example\x1b\\";
+    for (environment, expected) in [
+        (vec![], b"\x18".to_vec()),
+        (vec![("TMUX", "test")], tmux_wrap(status)),
+        (
+            vec![("HC_TERMINAL_ID", "t1"), ("HC_TERMINAL_SOCKET", "/test")],
+            status.to_vec(),
+        ),
+    ] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_tfil"))
+            .env_remove("TMUX")
+            .env_remove("HC_TERMINAL_ID")
+            .env_remove("HC_TERMINAL_SOCKET")
+            .envs(environment)
+            .args([
+                "--filter-terminal-strings=auto",
+                "--",
+                "/bin/sh",
+                "-c",
+                r"printf '\033]7501;state=working:app=example\033\\'",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _input = child.stdin.take();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, expected);
+    }
+}

@@ -34,19 +34,31 @@ With no behavior options, `tfil` is a transparent PTY proxy.  Options can be com
 % tfil --strip-ink-fake-cursor claude --resume
 ```
 
+### Presets
+
+```console
+% tfil --preset=codex codex
+% tfil --preset=claude claude --resume
+```
+
+- `codex` enables `--codex-mouse-ui` and `--critty-notify`.
+- `claude` enables `--strip-ink-fake-cursor`.
+
+Both presets use the current tmux passthrough setting.  Add `--tmux-osc-passthrough=22` to the `codex` preset to relay its pointer-shape updates from tmux.  See [Automatic terminal string filtering](#automatic-terminal-string-filtering) for a setup that keeps Codex images working.
+
 ### Output filters
 
 - `--strip-cursor-shape` — Drop DECSCUSR (`CSI Pn SP q`) so child programs cannot change the terminal's cursor shape.
 - `--strip-ink-fake-cursor` — Strip [Ink](https://github.com/vadimdemedes/ink)'s fake-cursor sequences (`\x1b[7m{grapheme}\x1b[27m` and friends), and suppress `\x1b[?25l` so the terminal's native cursor shows through.  Useful with Ink-based TUIs such as Claude Code, Gemini CLI, or ccmanager.
 - `--strip-osc-titles` — Drop OSC 0/1/2 sequences (icon name and window title).  Other OSCs (4 = palette, 8 = hyperlink, 52 = clipboard, ...) are passed through.  Both ST (`ESC \`) and BEL terminators are recognized.
-- `--strip-osc-unfocused=CODES` — Drop comma-separated OSC codes from child output until a focus-in report arrives, and after each focus-out report.  For example, `--strip-osc-unfocused=22` suppresses child pointer-shape updates while unfocused.  This works on plain OSCs before any tmux wrapping by tfil.  It requires a child that enables focus reporting and a terminal that sends focus reports.  In tmux, enable `focus-events` too.  Reports are forwarded to the child as usual.  Focus filtering is best-effort and depends on when the report arrives.
+- `--strip-osc-unfocused=CODES` — Drop comma-separated OSC codes from child output until a focus-in report arrives, and after each focus-out report.  For example, `--strip-osc-unfocused=22` suppresses child pointer-shape updates while unfocused.  This works on plain OSCs before any tmux wrapping by tfil.  Automatic filtering also checks OSCs inside tmux passthrough.  It requires a child that enables focus reporting and a terminal that sends focus reports.  In tmux, enable `focus-events` too.  Reports are forwarded to the child as usual.  Focus filtering is best-effort and depends on when the report arrives.
 - `--tmux-osc-passthrough=CODES` — Wrap the OSC sequences with the given comma-separated codes in a tmux `DCS tmux; ... ST` passthrough so they reach the outer terminal instead of being swallowed by tmux.  Requires tmux 3.3+ with `allow-passthrough on` set.
-- `--filter-terminal-strings` — Filter child control strings in any terminal or multiplexer.  See [Terminal string filtering](#terminal-string-filtering) for the allowed sequences.
+- `--filter-terminal-strings[=MODE]` — Filter child control strings.  The default mode when the flag has no value is `strict`.  Set `--filter-terminal-strings=auto` to allow selected images and status updates in tmux and herdr-core.
 - `--tmux-managed-passthrough` — Set `allow-passthrough all` on the current tmux pane for the lifetime of tfil.  A watchdog restores the pane's previous value or inheritance when tfil exits.  Pair it with `--filter-terminal-strings` when running a child whose output needs filtering.
 
 ### Terminal string filtering
 
-`--filter-terminal-strings` works with or without tmux and applies the same filters regardless of focus.
+`--filter-terminal-strings` and `--filter-terminal-strings=strict` work with or without tmux and apply the same filters regardless of focus.
 
 - Drops all DCS strings, including tmux passthrough, and all APC, PM, SOS, and legacy window-name strings.
 - Passes plain OSC 0, 1, 2, 7, 8, 10, 11, 12, and 133.  Drops the remaining child OSCs, including pointer shape (22), clipboard (52 and 5522), and notifications (9 and 777).
@@ -55,11 +67,22 @@ The filter recognizes both ESC-prefixed and C1 forms.  To drop only those five p
 
 With `--codex-mouse-ui`, tfil sends its own pointer updates when focus is confirmed.  The child must enable terminal focus reporting.  In tmux, enable `focus-events` and add `--tmux-osc-passthrough=22` to forward these pointer updates.  The terminal string filter runs before OSC wrapping, and the combined flags wrap OSCs only in tmux.  Add `--notify-on-exit` to send tfil's own exit notification.
 
+### Automatic terminal string filtering
+
+```console
+% tfil --preset=codex --filter-terminal-strings=auto --tmux-managed-passthrough codex
+```
+
+- **tmux**.  The managed option sets `allow-passthrough all` on the current pane before Codex starts and restores the previous setting on exit.  Omit it if the pane already uses `all`.  Codex needs fullscreen mode and a compatible tmux client to enable its image support.  tfil inspects the contents of each tmux passthrough and rebuilds the permitted sequences.  It checks Kitty image IDs against Codex's range for the pane.
+- **herdr-core**.  tfil passes validated Kitty graphics and OSC 7501 directly to the core.  The managed option has no effect here.  Ordinary terminals outside either environment use the strict filter.
+- **Focus**.  tfil allows OSC 22 (pointer shapes) and OSC 52/5522 (clipboard) only after a focus-in report and until the next focus-out report, including inside tmux passthrough.  The child must request terminal focus reports.  Enable `focus-events` in tmux.  Use `--strip-osc-unfocused` to add codes.  tfil bases its decision on input reports, which can arrive late.  Clipboard APIs and commands such as `tmux load-buffer` operate outside this output filter.
+- **Allowed output**.  Plain titles, tmux window names, and bells go to the multiplexer.  tfil allows valid OSC 9;4 progress, OSC 7501 status, and inline Kitty image commands regardless of focus.  The tfil mouse UI wraps its own pointer updates in tmux as needed.  `--tmux-osc-passthrough=22` can also wrap allowed pointer updates from the child.  tfil blocks child desktop notifications, other passthrough content, and Kitty file or shared-memory transfers.
+
 ### Using tmux passthrough with untrusted output
 
 `allow-passthrough all` lets an invisible pane send terminal controls to the outer terminal.  The focus filter above handles selected plain OSCs from the child before tfil wraps them.  It leaves child-supplied DCS passthrough and tfil-generated controls outside its scope.  Focus reports can also arrive after the focus has changed.
 
-If a pane displays untrusted output, keep `allow-passthrough off` for that pane unless a separate filter controls its output.  Use `--tmux-managed-passthrough` with `--filter-terminal-strings` to enable and restore passthrough while filtering child output.  The following rules also apply when building another filter for `all`.
+If a pane displays untrusted output, keep `allow-passthrough off` for that pane unless a separate filter controls its output.  Use `--tmux-managed-passthrough` with `--filter-terminal-strings` for strict filtering while passthrough is enabled.
 
 - Drop child-supplied DCS passthrough in every focus state.  Wrap only sequences the filter has validated.  Start with no other controls forwarded to the outer terminal.  Normal text, colors, and cursor movement can still be handled by tmux.
 - Block OSC 52 and 5522 clipboard reads and writes from the child in every focus state.  In tmux, `set-clipboard external` also blocks the regular OSC 52 path from applications while retaining copies initiated by tmux.  [tmux clipboard documentation](https://github.com/tmux/tmux/wiki/Clipboard#changing-set-clipboard) · [Ghostty clipboard protocols](https://ghostty.org/docs/install/release-notes/1-4-0#kitty-clipboard-protocol)
@@ -115,12 +138,11 @@ Critty was formerly called TCrit.  `--tcrit-notify` remains an alias, and both o
 `--create-wrapper=PATH` writes a small shell script that runs the command named after its basename through `tfil` with the given options, instead of running a command.  The recommended setup for Claude Code and Codex CLI is:
 
 ```console
-% tfil --create-wrapper=~/bin/claude --strip-ink-fake-cursor
-% tfil --create-wrapper=~/bin/codex --codex-mouse-ui --critty-notify \
-    --filter-terminal-strings --tmux-managed-passthrough --tmux-osc-passthrough=22
+% tfil --create-wrapper=~/bin/claude --preset=claude
+% tfil --create-wrapper=~/bin/codex --preset=codex
 ```
 
-Typing `claude` or `codex` then transparently runs the real command under `tfil` with the recommended enhancements.  The option is repeatable, so brace expansion creates several wrappers with the same options at once:
+Typing `claude` or `codex` then transparently runs the real command under `tfil` with the recommended enhancements.  Generated scripts store the individual options enabled by the preset.  `--create-wrapper` is repeatable, so brace expansion creates several wrappers with the same options at once:
 
 ```console
 % tfil --create-wrapper=~/bin/{claude,gemini} --strip-ink-fake-cursor
