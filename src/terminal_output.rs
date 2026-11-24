@@ -101,13 +101,13 @@ impl<W: Write> TerminalOutput<W> {
     }
 }
 
-struct SequenceTracker {
+pub(crate) struct SequenceTracker {
     parser: VTParser,
     actions: BoundaryActions,
 }
 
 impl SequenceTracker {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             parser: VTParser::new(),
             actions: BoundaryActions::default(),
@@ -116,27 +116,29 @@ impl SequenceTracker {
 
     fn parse(&mut self, bytes: &[u8]) {
         for &byte in bytes {
-            match self.actions.tmux {
-                TmuxState::Payload => {
-                    if byte == 0x1b {
-                        self.actions.tmux = TmuxState::Escape;
-                    }
-                }
-                TmuxState::Escape => {
-                    if byte == b'\\' {
-                        self.parser = VTParser::new();
-                        self.actions.tmux = TmuxState::None;
-                    } else {
-                        self.actions.tmux = TmuxState::Payload;
-                    }
-                }
-                _ => self.parser.parse_byte(byte, &mut self.actions),
-            }
+            self.parse_byte(byte);
         }
     }
 
-    fn is_ground(&self) -> bool {
+    pub(crate) fn parse_byte(&mut self, byte: u8) {
+        match self.actions.tmux {
+            TmuxState::Payload if byte == 0x1b => self.actions.tmux = TmuxState::Escape,
+            TmuxState::Payload => {}
+            TmuxState::Escape if byte == b'\\' => {
+                self.parser = VTParser::new();
+                self.actions.tmux = TmuxState::None;
+            }
+            TmuxState::Escape => self.actions.tmux = TmuxState::Payload,
+            _ => self.parser.parse_byte(byte, &mut self.actions),
+        }
+    }
+
+    pub(crate) fn is_ground(&self) -> bool {
         self.parser.is_ground() && self.actions.tmux == TmuxState::None
+    }
+
+    pub(crate) fn hyperlink_active(&self) -> bool {
+        self.actions.hyperlink_active
     }
 }
 
@@ -152,6 +154,7 @@ enum TmuxState {
 #[derive(Default)]
 struct BoundaryActions {
     tmux: TmuxState,
+    hyperlink_active: bool,
 }
 
 impl VTActor for BoundaryActions {
@@ -179,7 +182,11 @@ impl VTActor for BoundaryActions {
     }
     fn esc_dispatch(&mut self, _: &[i64], _: &[u8], _: bool, _: u8) {}
     fn csi_dispatch(&mut self, _: &[CsiParam], _: bool, _: u8) {}
-    fn osc_dispatch(&mut self, _: &[&[u8]]) {}
+    fn osc_dispatch(&mut self, params: &[&[u8]]) {
+        if let [b"8", _, uri, ..] = params {
+            self.hyperlink_active = !uri.is_empty();
+        }
+    }
     fn apc_dispatch(&mut self, _: Vec<u8>) {}
 }
 

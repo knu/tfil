@@ -41,18 +41,21 @@ With no behavior options, `tfil` is a transparent PTY proxy.  Options can be com
 % tfil --preset=claude claude --resume
 ```
 
-- `codex` enables `--codex-mouse-ui` and `--critty-notify`.  It uses automatic filtering in tmux and herdr-core, relays allowed pointer-shape updates through tmux, and manages passthrough in a foreground tmux pane for image support.
+- `codex` enables `--codex-mouse-ui`, `--critty-notify`, and `--link-file-paths`.  It uses automatic filtering in tmux and herdr-core, relays allowed pointer-shape updates through tmux, and manages passthrough in a foreground tmux pane for image support.
 - `claude` enables `--strip-ink-fake-cursor`.
 
 Outside tmux and herdr-core, the Codex preset leaves terminal-string filtering disabled unless you pass `--filter-terminal-strings` explicitly.  See [Automatic terminal string filtering](#automatic-terminal-string-filtering) for details.
 
 ### Output filters
 
+- `--link-file-paths` — Turn absolute references such as `(/path/to/file.rs:497)` into OSC 8 links.  The visible path and line number stay the same.  The destination uses `file:///path/to/file.rs#497`, which iTerm2 can pass to Semantic History for line navigation.  [iTerm2 escape codes](https://iterm2.com/documentation-escape-codes.html)
+
 - `--strip-cursor-shape` — Drop DECSCUSR (`CSI Pn SP q`) so child programs cannot change the terminal's cursor shape.
 - `--strip-ink-fake-cursor` — Strip [Ink](https://github.com/vadimdemedes/ink)'s fake-cursor sequences (`\x1b[7m{grapheme}\x1b[27m` and friends), and suppress `\x1b[?25l` so the terminal's native cursor shows through.  Useful with Ink-based TUIs such as Claude Code, Gemini CLI, or ccmanager.
 - `--strip-osc-titles` — Drop OSC 0/1/2 sequences (icon name and window title).  Other OSCs (4 = palette, 8 = hyperlink, 52 = clipboard, ...) are passed through.  Both ST (`ESC \`) and BEL terminators are recognized.
 - `--strip-osc-unfocused=CODES` — Drop comma-separated OSC codes from child output until a focus-in report arrives, and after each focus-out report.  For example, `--strip-osc-unfocused=22` suppresses child pointer-shape updates while unfocused.  This works on plain OSCs before any tmux wrapping by tfil.  Automatic filtering also checks OSCs inside tmux passthrough.  It requires a child that enables focus reporting and a terminal that sends focus reports.  In tmux, enable `focus-events` too.  Reports are forwarded to the child as usual.  Focus filtering is best-effort and depends on when the report arrives.
 - `--tmux-osc-passthrough=CODES` — Wrap the OSC sequences with the given comma-separated codes in a tmux `DCS tmux; ... ST` passthrough so they reach the outer terminal instead of being swallowed by tmux.  Requires tmux 3.3+ with `allow-passthrough on` set.
+- `--tmux-image-passthrough` — Wrap bare Kitty graphics and iTerm2 inline image sequences for one tmux layer.  Use it when running a nested tmux client, whose output needs to pass through the outer tmux pane.  Enable `allow-passthrough on` in that pane.
 - `--filter-terminal-strings[=MODE]` — Filter child control strings.  The default mode when the flag has no value is `strict`.  Set `--filter-terminal-strings=auto` to allow selected images and status updates in tmux and herdr-core.
 - `--tmux-managed-passthrough` — Set `allow-passthrough all` on the current tmux pane for the lifetime of tfil.  A watchdog restores the pane's previous value or inheritance when tfil exits.  Pair it with `--filter-terminal-strings` when running a child whose output needs filtering.
 

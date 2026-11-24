@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use file_link_filter::FileLinkFilter;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
@@ -14,9 +15,11 @@ use tfil::filters::{
 };
 
 mod critty_notify;
+mod file_link_filter;
 mod session;
 mod terminal_output;
 mod terminal_string_filter;
+mod tmux_image_passthrough;
 mod tmux_passthrough;
 mod wrapper;
 
@@ -24,7 +27,7 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"),
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Preset {
-    /// Enable Codex mouse UI, Critty integration, and filtering in supported multiplexers
+    /// Enable Codex mouse UI, Critty integration, file links, and multiplexer support
     Codex,
     /// Strip Ink's fake cursor sequences
     Claude,
@@ -61,6 +64,10 @@ struct Cli {
     #[arg(long)]
     strip_osc_titles: bool,
 
+    /// Link absolute path:line references with OSC 8
+    #[arg(long)]
+    link_file_paths: bool,
+
     /// Drop the given OSC codes until the terminal reports focus, and while unfocused.
     /// The child must enable terminal focus reporting.
     #[arg(long, value_name = "CODES", value_delimiter = ',')]
@@ -87,6 +94,10 @@ struct Cli {
     /// `allow-passthrough on`)
     #[arg(long, value_name = "CODES", value_delimiter = ',')]
     tmux_osc_passthrough: Vec<u16>,
+
+    /// Wrap Kitty and iTerm2 inline image sequences for one tmux layer.
+    #[arg(long, conflicts_with_all = ["filter_terminal_strings", "preset"])]
+    tmux_image_passthrough: bool,
 
     /// Filter child terminal strings (default mode when specified without a value: strict)
     #[arg(long, value_name = "MODE", num_args = 0..=1, require_equals = true, default_missing_value = "strict")]
@@ -137,6 +148,7 @@ impl Cli {
             Some(Preset::Codex) => {
                 self.codex_mouse_ui = true;
                 self.critty_notify = true;
+                self.link_file_paths = true;
             }
             Some(Preset::Claude) => self.strip_ink_fake_cursor = true,
             None => {}
@@ -159,6 +171,9 @@ impl Cli {
         }
         if self.strip_osc_titles {
             args.push("--strip-osc-titles".to_string());
+        }
+        if self.link_file_paths && !codex_preset {
+            args.push("--link-file-paths".to_string());
         }
         if !self.strip_osc_unfocused.is_empty() {
             let codes: Vec<String> = self
@@ -193,6 +208,9 @@ impl Cli {
                 .map(u16::to_string)
                 .collect();
             args.push(format!("--tmux-osc-passthrough={}", codes.join(",")));
+        }
+        if self.tmux_image_passthrough {
+            args.push("--tmux-image-passthrough".to_string());
         }
         if let Some(path) = &self.debug_dump {
             args.push(format!("--debug-dump={}", path.display()));
@@ -358,6 +376,9 @@ fn run(
     if cli.strip_cursor_shape {
         filters.push(Box::new(CursorShapeFilter::new()));
     }
+    if cli.link_file_paths {
+        filters.push(Box::new(FileLinkFilter::new()));
+    }
     let tmux_osc_passthrough = if codex_preset && in_tmux && cli.tmux_osc_passthrough.is_empty() {
         vec![22]
     } else {
@@ -395,6 +416,9 @@ fn run(
         filters.push(Box::new(TmuxOscPassthroughFilter::new(
             tmux_osc_passthrough,
         )));
+    }
+    if cli.tmux_image_passthrough {
+        filters.push(Box::new(tmux_image_passthrough::ImagePassthrough::default()));
     }
     let tmux_pointer = (auto_endpoint.is_some() && in_tmux) || (wrap_osc && passthrough_pointer);
     let filters = FilterChain::new(filters);
@@ -551,9 +575,10 @@ mod tests {
     fn wrapper_args_cover_all_behavior_options() {
         use clap::CommandFactory;
 
-        // Preset handling is exercised separately.
+        // Presets and image passthrough are exercised separately.
         const EXCLUDED: &[&str] = &[
             "preset",
+            "tmux-image-passthrough",
             "wrap",
             "create-wrapper",
             "force",
@@ -566,6 +591,7 @@ mod tests {
             "--strip-cursor-shape",
             "--strip-ink-fake-cursor",
             "--strip-osc-titles",
+            "--link-file-paths",
             "--strip-osc-unfocused=22,52",
             "--codex-mouse-ui",
             "--critty-notify",
@@ -592,6 +618,21 @@ mod tests {
                 "--{long} is not covered; update to_wrapper_args() and this test's argv"
             );
         }
+    }
+
+    #[test]
+    fn wrapper_args_keep_tmux_image_passthrough() {
+        let cli = Cli::parse_from(["tfil", "--tmux-image-passthrough", "--create-wrapper=tmux"]);
+        assert_eq!(cli.to_wrapper_args(), ["--tmux-image-passthrough"]);
+        assert!(
+            Cli::try_parse_from([
+                "tfil",
+                "--tmux-image-passthrough",
+                "--filter-terminal-strings",
+                "cmd"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

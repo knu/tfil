@@ -2,6 +2,38 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[test]
+fn file_links_reach_the_terminal_with_string_filtering() {
+    for (args, tmux) in [
+        (
+            &["--link-file-paths", "--filter-terminal-strings"][..],
+            false,
+        ),
+        (&["--preset=codex"][..], true),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tfil"));
+        command.env_remove("TMUX").env_remove("TMUX_PANE");
+        if tmux {
+            command.env("TMUX", "test");
+        }
+        let mut child = command
+            .args(args)
+            .args(["--", "/bin/sh", "-c", "printf '%s' 'see (/src/lib.rs:497)'"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _input = child.stdin.take();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(
+            output.stdout,
+            b"see (\x1b]8;;file:///src/lib.rs#497\x1b\\/src/lib.rs:497\x1b]8;;\x1b\\)"
+        );
+    }
+}
+
+#[test]
 fn broken_output_stops_a_child_that_keeps_writing() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_tfil"))
         .args([

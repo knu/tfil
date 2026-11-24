@@ -8,6 +8,13 @@ version bumps for fixes.  Once `1.0.0` ships, the project will revisit and
 likely adopt strict [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.6.0] - 2026-11-25
+
+### Added
+
+- Make absolute `path:line` references clickable in the Codex preset and with `--link-file-paths`.  Existing links stay intact.  iTerm2 Semantic History can open the file at the referenced line.
+- Add `--tmux-image-passthrough` to relay Kitty and iTerm2 images through an outer tmux pane.  Set `allow-passthrough on` in that pane.
+
 ## [0.5.1] - 2026-11-23
 
 ### Fixed
